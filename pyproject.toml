@@ -1,0 +1,13 @@
+[project]
+name = "hoverpilot-rflink"
+version = "0.1.0"
+description = "RealFlight Link client for HoverPilot"
+requires-python = ">=3.10"
+
+dependencies = [
+    "pydantic",
+    "python-dotenv"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
