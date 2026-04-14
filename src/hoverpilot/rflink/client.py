@@ -1,6 +1,7 @@
 import socket
+from typing import Mapping
 
-from hoverpilot.rflink.models import FlightAxisState
+from hoverpilot.rflink.models import DEFAULT_CHANNEL_MAP, FlightAxisState, RFControlAction
 from hoverpilot.rflink.protocol import (
     build_exchange_data_request,
     build_simple_request,
@@ -11,9 +12,15 @@ from hoverpilot.rflink.protocol import (
 
 
 class RFLinkClient:
-    def __init__(self, host: str, port: int):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        channel_map: Mapping[str, int] | None = None,
+    ):
         self.host = host
         self.port = port
+        self.channel_map = dict(DEFAULT_CHANNEL_MAP if channel_map is None else channel_map)
         self.sock = None
         self._buffer = b""
         self._controller_started = False
@@ -23,15 +30,15 @@ class RFLinkClient:
         self._open_socket(log=True)
         self._start_controller()
 
-    def request_state(self) -> FlightAxisState:
+    def request_state(self, action: RFControlAction | None = None) -> FlightAxisState:
         try:
             self._ensure_controller_ready()
-            self._send_exchange_request()
+            self._send_exchange_request(action)
             response = self._receive_http_response()
         except (ConnectionError, OSError):
             self._reset_connection()
             self._ensure_controller_ready()
-            self._send_exchange_request()
+            self._send_exchange_request(action)
             response = self._receive_http_response()
 
         body = parse_http_body(response)
@@ -40,9 +47,10 @@ class RFLinkClient:
             self._printed_zero_state_debug = True
             print("[RFLINK] Received zeroed state. First SOAP body follows:")
             print(body[:2000])
-        if abs(state.m_flightAxisControllerIsActive) < 1.0e-9:
-            self._controller_started = False
         return state
+
+    def step(self, action: RFControlAction | None = None) -> FlightAxisState:
+        return self.request_state(action=action)
 
     def close(self):
         if self.sock:
@@ -83,9 +91,10 @@ class RFLinkClient:
         self._receive_http_response(close_after_read=True)
         self._open_socket(log=False)
 
-    def _send_exchange_request(self):
+    def _send_exchange_request(self, action: RFControlAction | None = None):
         self._ensure_socket()
-        self.sock.sendall(build_exchange_data_request(self.host))
+        channel_values = None if action is None else action.to_channel_values(self.channel_map)
+        self.sock.sendall(build_exchange_data_request(self.host, channel_values=channel_values))
 
     def _receive_http_response(self, close_after_read: bool = True) -> bytes:
         self._ensure_socket()

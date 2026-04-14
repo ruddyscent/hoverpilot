@@ -1,6 +1,6 @@
 from xml.etree import ElementTree as ET
 
-from hoverpilot.rflink.models import FlightAxisState
+from hoverpilot.rflink.models import FlightAxisState, RF_CHANNEL_COUNT
 
 
 SOAP_ENVELOPE_PREFIX = """<?xml version='1.0' encoding='UTF-8'?>
@@ -84,9 +84,9 @@ def build_exchange_data_request(
     channel_values: list[float] | None = None,
     selected_channels: int = 4095,
 ) -> bytes:
-    values = channel_values or [0.0] * 12
-    if len(values) != 12:
-        raise ValueError("channel_values must contain 12 items")
+    values = channel_values or [0.0] * RF_CHANNEL_COUNT
+    if len(values) != RF_CHANNEL_COUNT:
+        raise ValueError(f"channel_values must contain {RF_CHANNEL_COUNT} items")
 
     channel_items = "\n".join(f"          <item>{value:.4f}</item>" for value in values)
     body = f"""<?xml version='1.0' encoding='UTF-8'?>
@@ -154,7 +154,7 @@ def parse_state(xml_text: str) -> FlightAxisState:
             setattr(state, field_name, value)
 
     if item_values:
-        state.rcin = (item_values + [0.0] * 12)[:12]
+        state.rcin = (item_values + [0.0] * RF_CHANNEL_COUNT)[:RF_CHANNEL_COUNT]
 
     return state
 
