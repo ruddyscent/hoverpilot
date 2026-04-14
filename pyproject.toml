@@ -5,6 +5,8 @@ description = "RealFlight Link client for HoverPilot"
 requires-python = ">=3.10"
 
 dependencies = [
+    "gymnasium",
+    "numpy",
     "pydantic",
     "python-dotenv"
 ]

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from hoverpilot.rflink.models import FlightAxisState
 
@@ -18,7 +18,15 @@ class RewardConfig:
     boundary_proximity_weight: float = 0.75
     terminal_failure_reward: float = -25.0
     proximity_penalty_margin_ratio: float = 0.25
-    controller_active_threshold: float = 0.5
+    controller_active_threshold: float | None = None
+    lost_components_threshold: float = 0.5
+    locked_threshold: float = 0.5
+    engine_running_threshold: float = 0.5
+    touching_ground_threshold: float = 0.5
+    terminate_on_engine_stopped: bool = False
+    terminate_on_touching_ground: bool = True
+    ground_contact_grace_seconds: float = 0.0
+    known_terminal_aircraft_status_codes: tuple[float, ...] = field(default_factory=tuple)
 
 
 @dataclass(slots=True)
@@ -43,7 +51,13 @@ class RewardBreakdown:
 def compute_termination(
     state: FlightAxisState,
     config: RewardConfig,
+    *,
+    episode_started: bool = True,
+    ground_contact_duration_s: float = 0.0,
 ) -> TerminationResult:
+    if state.m_hasLostComponents > config.lost_components_threshold:
+        return TerminationResult(True, "lost_components")
+
     x_error = state.m_aircraftPositionX_MTR - config.target_x_m
     if abs(x_error) > config.max_abs_x_m:
         return TerminationResult(True, "out_of_bounds_x")
@@ -58,11 +72,32 @@ def compute_termination(
     if altitude_agl_m > config.max_altitude_agl_m:
         return TerminationResult(True, "altitude_too_high")
 
-    if state.m_hasLostComponents > 0.0:
-        return TerminationResult(True, "lost_components")
+    if state.m_isLocked > config.locked_threshold:
+        return TerminationResult(True, "vehicle_locked")
 
-    if state.m_flightAxisControllerIsActive < config.controller_active_threshold:
+    if (
+        config.controller_active_threshold is not None
+        and state.m_flightAxisControllerIsActive < config.controller_active_threshold
+    ):
         return TerminationResult(True, "controller_inactive")
+
+    if (
+        episode_started
+        and config.terminate_on_engine_stopped
+        and state.m_anEngineIsRunning < config.engine_running_threshold
+    ):
+        return TerminationResult(True, "engine_stopped")
+
+    if (
+        episode_started
+        and config.terminate_on_touching_ground
+        and state.m_isTouchingGround > config.touching_ground_threshold
+        and ground_contact_duration_s >= config.ground_contact_grace_seconds
+    ):
+        return TerminationResult(True, "touching_ground")
+
+    if state.m_currentAircraftStatus in config.known_terminal_aircraft_status_codes:
+        return TerminationResult(True, "aircraft_status_terminal")
 
     return TerminationResult(False, None)
 
@@ -71,8 +106,16 @@ def compute_termination(
 def compute_reward(
     state: FlightAxisState,
     config: RewardConfig,
+    *,
+    episode_started: bool = True,
+    ground_contact_duration_s: float = 0.0,
 ) -> RewardBreakdown:
-    termination = compute_termination(state, config)
+    termination = compute_termination(
+        state,
+        config,
+        episode_started=episode_started,
+        ground_contact_duration_s=ground_contact_duration_s,
+    )
 
     x_error = state.m_aircraftPositionX_MTR - config.target_x_m
     y_error = state.m_aircraftPositionY_MTR - config.target_y_m
