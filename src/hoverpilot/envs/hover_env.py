@@ -11,13 +11,9 @@ from hoverpilot.rflink.models import FlightAxisState, RFControlAction
 from hoverpilot.rflink.protocol import state_looks_uninitialized
 from hoverpilot.training.hover import RewardConfig, TerminationResult, compute_reward, compute_termination
 
-OBSERVATION_SIZE = 12
 TRAINER_RESET_REASONS = {
     "trainer_reset",
     "trainer_reset_button",
-    "crash_reset",
-    "controller_reactivated",
-    "engine_restarted",
     "trainer_repositioned",
 }
 BOOL_FIELD_THRESHOLD = 0.5
@@ -32,6 +28,14 @@ class EpisodeLifecycleResult:
     terminated: bool
     truncated: bool
     reason: str | None = None
+
+
+@dataclass(slots=True)
+class EpisodeBoundaryAssessment:
+    readiness: EpisodeLifecycleResult
+    reset_reason: str | None
+    can_start: bool
+    pre_reset_wait: bool
 
 
 def state_to_observation(state: FlightAxisState) -> np.ndarray:
@@ -102,13 +106,10 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         ready_locked_threshold: float = BOOL_FIELD_THRESHOLD,
         require_nonzero_physics_time_for_ready: bool = True,
         allow_ground_contact_at_ready: bool = True,
-        allow_reset_like_stationary_start: bool = False,
         minimum_start_altitude_agl_m: float = 0.25,
         start_groundspeed_threshold_mps: float = 1.0,
         start_airspeed_threshold_mps: float = 1.5,
         start_body_rate_threshold_deg_s: float = 60.0,
-        reposition_position_margin_ratio: float = 0.35,
-        reposition_altitude_margin_ratio: float = 0.5,
         reposition_speed_threshold_mps: float = 0.5,
         reset_teleport_distance_m: float = 2.0,
         client_factory: Callable[[], RFLinkClient] | None = None,
@@ -130,13 +131,10 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         self.ready_locked_threshold = ready_locked_threshold
         self.require_nonzero_physics_time_for_ready = require_nonzero_physics_time_for_ready
         self.allow_ground_contact_at_ready = allow_ground_contact_at_ready
-        self.allow_reset_like_stationary_start = allow_reset_like_stationary_start
         self.minimum_start_altitude_agl_m = minimum_start_altitude_agl_m
         self.start_groundspeed_threshold_mps = start_groundspeed_threshold_mps
         self.start_airspeed_threshold_mps = start_airspeed_threshold_mps
         self.start_body_rate_threshold_deg_s = start_body_rate_threshold_deg_s
-        self.reposition_position_margin_ratio = reposition_position_margin_ratio
-        self.reposition_altitude_margin_ratio = reposition_altitude_margin_ratio
         self.reposition_speed_threshold_mps = reposition_speed_threshold_mps
         self.reset_teleport_distance_m = reset_teleport_distance_m
         self._client_factory = (
@@ -147,8 +145,6 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         self._last_state: FlightAxisState | None = None
         self._pending_episode_start: tuple[FlightAxisState, str] | None = None
         self._waiting_for_reset = False
-        self._reset_wait_saw_lost_components = False
-        self._reset_wait_saw_crash_signature = False
         self._episode_started = False
         self._ground_contact_started_at_s: float | None = None
 
@@ -201,8 +197,6 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         self._last_state = None
         self._pending_episode_start = None
         self._waiting_for_reset = False
-        self._reset_wait_saw_lost_components = False
-        self._reset_wait_saw_crash_signature = False
         self._episode_started = False
         self._ground_contact_started_at_s = None
         self.close()
@@ -250,11 +244,13 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
 
         if trainer_reset_reason is not None:
             self._waiting_for_reset = True
-            self._reset_wait_saw_lost_components = False
-            self._reset_wait_saw_crash_signature = False
             self._episode_started = False
             self._pending_episode_start = (state, trainer_reset_reason)
-            if self._can_start_episode_from_state(state, reset_reason=trainer_reset_reason):
+            if self._assess_episode_boundary(
+                state,
+                require_reset_boundary=False,
+                pending_reset_reason=trainer_reset_reason,
+            ).can_start:
                 self._waiting_for_reset = False
             reward_breakdown = replace(
                 reward_breakdown,
@@ -272,8 +268,6 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
 
         if termination.terminated and trainer_reset_reason is None:
             self._waiting_for_reset = True
-            self._reset_wait_saw_lost_components = self._is_lost_components_active(state)
-            self._reset_wait_saw_crash_signature = self._is_crash_signature(state)
             self._episode_started = False
             lifecycle = replace(lifecycle, started=False)
 
@@ -307,37 +301,38 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
 
         if self._pending_episode_start is not None:
             pending_state, reason = self._pending_episode_start
-            if self._can_start_episode_from_state(pending_state, reset_reason=reason):
+            assessment = self._assess_episode_boundary(
+                pending_state,
+                require_reset_boundary=False,
+                pending_reset_reason=reason,
+            )
+            if assessment.can_start:
                 self._pending_episode_start = None
                 observation, info = self._start_episode_from_state(pending_state, episode_start_reason=reason)
                 return True, observation, info
 
         wait_action = self._safe_start_action() if action is None else gym_action_to_rf_action(action)
         state = self._poll_state(wait_action, interval_s=self.reset_poll_interval_seconds)
-        trainer_reset_reason = self._detect_trainer_reset(state)
-        readiness = self.compute_episode_start_status(state)
-        if trainer_reset_reason is not None:
-            self._pending_episode_start = (state, trainer_reset_reason)
+        pending_reason = self._pending_episode_start[1] if self._pending_episode_start is not None else None
+        assessment = self._assess_episode_boundary(
+            state,
+            require_reset_boundary=self._waiting_for_reset,
+            pending_reset_reason=pending_reason,
+        )
+        if assessment.reset_reason is not None:
+            self._pending_episode_start = (state, assessment.reset_reason)
+            pending_reason = assessment.reset_reason
 
-        if self._pending_episode_start is not None:
-            _, reason = self._pending_episode_start
-        else:
-            reason = None
-
-        if self._pending_episode_start is not None and self._can_start_episode_from_state(state, reset_reason=reason):
+        if self._pending_episode_start is not None and assessment.can_start:
             self._pending_episode_start = None
-            observation, info = self._start_episode_from_state(state, episode_start_reason=reason)
+            observation, info = self._start_episode_from_state(state, episode_start_reason=pending_reason)
             return True, observation, info
-        if self._is_lost_components_active(state):
-            self._reset_wait_saw_lost_components = True
-        if self._is_crash_signature(state):
-            self._reset_wait_saw_crash_signature = True
         lifecycle = EpisodeLifecycleResult(
-            ready=readiness.ready,
+            ready=assessment.readiness.ready,
             started=False,
             terminated=False,
             truncated=False,
-            reason=readiness.reason,
+            reason=assessment.readiness.reason,
         )
         info = self._build_info(
             state=state,
@@ -347,7 +342,7 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
             episode_start_reason=None,
             waiting_for_reset=True,
             lifecycle=lifecycle,
-            readiness=readiness,
+            readiness=assessment.readiness,
             ground_contact_duration_s=0.0,
         )
         self._last_state = state
@@ -403,25 +398,28 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         last_state: FlightAxisState | None = None
         last_reason = "reset_timeout"
         startup_sync_required = False
-        pending_start_reason = "reset_ready"
+        pending_start_reason: str | None = None
         while time.monotonic() <= deadline:
             state = self._poll_state(action, interval_s=self.reset_poll_interval_seconds)
-            readiness = self.compute_episode_start_status(state)
-            trainer_reset_reason = self._detect_trainer_reset(state)
+            assessment = self._assess_episode_boundary(
+                state,
+                require_reset_boundary=startup_sync_required,
+                pending_reset_reason=pending_start_reason,
+            )
             self._last_state = state
             last_state = state
-            last_reason = readiness.reason or last_reason
-            if not startup_sync_required and self._requires_reset_boundary_sync(state):
+            last_reason = assessment.readiness.reason or last_reason
+            if not startup_sync_required and assessment.pre_reset_wait:
                 startup_sync_required = True
                 self._waiting_for_reset = True
 
-            if trainer_reset_reason is not None:
-                pending_start_reason = trainer_reset_reason
+            if assessment.reset_reason is not None:
+                pending_start_reason = assessment.reset_reason
                 startup_sync_required = False
 
-            if self._can_start_episode_from_state(state, reset_reason=pending_start_reason) and not startup_sync_required:
+            if assessment.can_start and not startup_sync_required:
                 self._waiting_for_reset = False
-                return state, pending_start_reason
+                return state, pending_start_reason or "reset_ready"
         diagnostics = "none"
         if last_state is not None:
             diagnostics = self._format_readiness_diagnostics(last_state)
@@ -439,8 +437,6 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_steps = 0
         self._pending_episode_start = None
         self._waiting_for_reset = False
-        self._reset_wait_saw_lost_components = False
-        self._reset_wait_saw_crash_signature = False
         self._episode_started = True
         self._ground_contact_started_at_s = None
         if self.anchor_target_to_reset_state:
@@ -504,16 +500,12 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
                 "ready_controller_active_threshold": self.ready_controller_active_threshold,
                 "ready_running_threshold": self.ready_running_threshold,
                 "ready_locked_threshold": self.ready_locked_threshold,
-                "allow_reset_like_stationary_start": self.allow_reset_like_stationary_start,
                 "minimum_start_altitude_agl_m": self.minimum_start_altitude_agl_m,
                 "start_groundspeed_threshold_mps": self.start_groundspeed_threshold_mps,
                 "start_airspeed_threshold_mps": self.start_airspeed_threshold_mps,
                 "start_body_rate_threshold_deg_s": self.start_body_rate_threshold_deg_s,
-                "reposition_position_margin_ratio": self.reposition_position_margin_ratio,
-                "reposition_altitude_margin_ratio": self.reposition_altitude_margin_ratio,
                 "reposition_speed_threshold_mps": self.reposition_speed_threshold_mps,
                 "reset_teleport_distance_m": self.reset_teleport_distance_m,
-                "saw_crash_signature": self._reset_wait_saw_crash_signature,
             },
             "target_hover": {
                 "x_m": self.reward_config.target_x_m,
@@ -545,39 +537,9 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
             state.m_currentPhysicsTime_SEC + self.physics_time_reset_tolerance_s
             < previous_state.m_currentPhysicsTime_SEC
         ):
-            if self._reset_wait_saw_lost_components or self._is_lost_components_active(previous_state):
-                return "crash_reset"
             return "trainer_reset"
 
-        if (
-            self._waiting_for_reset
-            and self._reset_wait_saw_lost_components
-            and self._is_lost_components_active(previous_state)
-            and not self._is_lost_components_active(state)
-        ):
-            return "crash_reset"
-
-        if (
-            self._waiting_for_reset
-            and self._reset_wait_saw_crash_signature
-            and self._is_reset_recovery_signature(state)
-        ):
-            return "crash_reset"
-
-        if self._waiting_for_reset and self._reactivated(previous_state, state, selector=self._is_controller_active):
-            if self._reset_wait_saw_lost_components:
-                return "crash_reset"
-            return "controller_reactivated"
-
-        if self._waiting_for_reset and self._reactivated(previous_state, state, selector=self._is_engine_running):
-            if self._reset_wait_saw_lost_components:
-                return "crash_reset"
-            return "engine_restarted"
-
         if self._looks_like_reset_teleport(previous_state, state):
-            return "trainer_repositioned"
-
-        if self._waiting_for_reset and self._looks_like_repositioned_ready_state(state):
             return "trainer_repositioned"
 
         return None
@@ -598,46 +560,6 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         return state.m_isTouchingGround > self.reward_config.touching_ground_threshold
 
 
-    def _is_crash_signature(self, state: FlightAxisState) -> bool:
-        # Conservative crash-wait signature observed in the hover trainer:
-        # lost components, engine stopped, and touching ground together.
-        return (
-            self._is_lost_components_active(state)
-            and state.m_anEngineIsRunning <= self.reward_config.engine_running_threshold
-            and self._is_touching_ground(state)
-        )
-
-    def _is_reset_recovery_signature(self, state: FlightAxisState) -> bool:
-        # Conservative reset-ready signature observed after trainer recovery:
-        # components restored, engine running, and no longer touching ground.
-        return (
-            not self._is_lost_components_active(state)
-            and state.m_anEngineIsRunning >= self.reward_config.engine_running_threshold
-            and not self._is_touching_ground(state)
-            and self.compute_episode_start_status(state).ready
-        )
-
-    def _is_controller_active(self, state: FlightAxisState) -> bool:
-        threshold = self.ready_controller_active_threshold
-        if threshold is None:
-            return False
-        return state.m_flightAxisControllerIsActive >= threshold
-
-    def _is_engine_running(self, state: FlightAxisState) -> bool:
-        threshold = self.ready_running_threshold
-        if threshold is None:
-            return False
-        return state.m_anEngineIsRunning >= threshold
-
-    def _reactivated(
-        self,
-        previous_state: FlightAxisState,
-        state: FlightAxisState,
-        *,
-        selector: Callable[[FlightAxisState], bool],
-    ) -> bool:
-        return not selector(previous_state) and selector(state)
-
     def _format_readiness_diagnostics(self, state: FlightAxisState) -> str:
         return (
             f"locked={state.m_isLocked:.1f} lost={state.m_hasLostComponents:.1f} "
@@ -654,32 +576,37 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
             return False
         if not self.compute_episode_start_status(state).ready:
             return False
+        if self._is_reset_like_stationary_state(state) and self._is_inactive_reset_state(state):
+            return True
         if self._is_low_altitude_wait_state(previous_state) and not self._is_low_altitude_wait_state(state):
             return True
-        return (
-            self._is_reset_like_stationary_state(previous_state)
-            and self._is_reset_like_stationary_state(state)
-            and self._is_inactive_reset_state(state)
-        )
+        return False
 
-    def _can_start_episode_from_state(self, state: FlightAxisState, reset_reason: str | None = None) -> bool:
+    def _assess_episode_boundary(
+        self,
+        state: FlightAxisState,
+        *,
+        require_reset_boundary: bool,
+        pending_reset_reason: str | None,
+    ) -> EpisodeBoundaryAssessment:
         readiness = self.compute_episode_start_status(state)
-        if not readiness.ready:
-            return False
-        if self._is_low_altitude_wait_state(state):
-            return False
-        if reset_reason in TRAINER_RESET_REASONS:
-            return True
-        if not self._is_start_stable_state(state):
-            return False
-        if self.allow_reset_like_stationary_start:
-            return True
-        return not (
-            self._is_reset_like_stationary_state(state)
-            and self._is_inactive_reset_state(state)
-        )
+        reset_reason = self._detect_trainer_reset(state)
+        effective_reset_reason = reset_reason or pending_reset_reason
+        pre_reset_wait = self._is_pre_reset_wait_state(state)
+        if effective_reset_reason in TRAINER_RESET_REASONS and not self._is_low_altitude_wait_state(state):
+            pre_reset_wait = False
+        can_start = readiness.ready and not pre_reset_wait
+        if can_start and effective_reset_reason in TRAINER_RESET_REASONS:
+            return EpisodeBoundaryAssessment(readiness, reset_reason, True, pre_reset_wait)
+        if can_start and require_reset_boundary:
+            can_start = False
+        if can_start and not self._is_start_stable_state(state):
+            can_start = False
+        if can_start and self._is_reset_like_stationary_state(state) and self._is_inactive_reset_state(state):
+            can_start = False
+        return EpisodeBoundaryAssessment(readiness, reset_reason, can_start, pre_reset_wait)
 
-    def _requires_reset_boundary_sync(self, state: FlightAxisState) -> bool:
+    def _is_pre_reset_wait_state(self, state: FlightAxisState) -> bool:
         return (
             self._is_low_altitude_wait_state(state)
             or (
@@ -707,28 +634,6 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
             and abs(state.m_pitchRate_DEGpSEC) <= self.start_body_rate_threshold_deg_s
             and abs(state.m_rollRate_DEGpSEC) <= self.start_body_rate_threshold_deg_s
             and abs(state.m_yawRate_DEGpSEC) <= self.start_body_rate_threshold_deg_s
-        )
-
-    def _looks_like_repositioned_ready_state(self, state: FlightAxisState) -> bool:
-        readiness = self.compute_episode_start_status(state)
-        if not readiness.ready:
-            return False
-        if not self._is_reset_like_stationary_state(state):
-            return False
-        return self._is_inactive_reset_state(state) and self._is_near_hover_target(state)
-
-    def _is_near_hover_target(self, state: FlightAxisState) -> bool:
-        x_margin = max(0.5, self.reward_config.max_abs_x_m * self.reposition_position_margin_ratio)
-        y_margin = max(0.5, self.reward_config.max_abs_y_m * self.reposition_position_margin_ratio)
-        altitude_span = max(
-            0.5,
-            self.reward_config.max_altitude_agl_m - self.reward_config.min_altitude_agl_m,
-        )
-        altitude_margin = altitude_span * self.reposition_altitude_margin_ratio
-        return (
-            abs(state.m_aircraftPositionX_MTR - self.reward_config.target_x_m) <= x_margin
-            and abs(state.m_aircraftPositionY_MTR - self.reward_config.target_y_m) <= y_margin
-            and abs(state.m_altitudeAGL_MTR - self.reward_config.target_altitude_agl_m) <= altitude_margin
         )
 
     def _is_reset_like_stationary_state(self, state: FlightAxisState) -> bool:

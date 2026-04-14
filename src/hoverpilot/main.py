@@ -24,7 +24,7 @@ def main():
         max_episode_steps=None,
     )
 
-    hover_test_action = np.asarray([0.0, 0.0, 0.7, 0.0], dtype=np.float32)
+    hover_test_action = np.asarray([0.0, 0.0, 0.55, 0.0], dtype=np.float32)
     wait_action = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     try:

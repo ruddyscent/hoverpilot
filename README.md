@@ -106,13 +106,12 @@ Reset-wait and restart:
 - Restart signals are checked in this order:
   - reset button pressed
   - physics time rollback
-  - lost-components recovery after a crash
-  - observed crash signature recovery:
-    `m_hasLostComponents > 0`, `m_anEngineIsRunning == 0`, `m_isTouchingGround == 1`
-    followed by
-    `m_hasLostComponents == 0`, `m_anEngineIsRunning == 1`, `m_isTouchingGround == 0`
-  - controller or engine reactivation
-  - trainer-driven reposition / teleport back near the hover target while the vehicle is nearly stationary
+  - trainer-driven reposition / teleport into a reset-like stationary state
+- In the current Airplane Hover Trainer setup, the more semantic crash / recovery flags
+  (`m_hasLostComponents`, `m_anEngineIsRunning`, `m_isTouchingGround`) often stay fixed at
+  `0`, so they are still exposed in `debug_state` but are not used as primary reset signals.
+  You can verify that behavior with:
+  `RFLINK_DEBUG_STATE_FLAGS=1 python -m hoverpilot.main`
 
 Useful tuning parameters on `HoverPilotHoverEnv`:
 
@@ -124,8 +123,6 @@ Useful tuning parameters on `HoverPilotHoverEnv`:
   - `ready_locked_threshold`
   - `allow_ground_contact_at_ready`
 - teleport fallback:
-  - `reposition_position_margin_ratio`
-  - `reposition_altitude_margin_ratio`
   - `reposition_speed_threshold_mps`
   - `reset_teleport_distance_m`
 - termination thresholds via `RewardConfig`:
@@ -134,7 +131,7 @@ Useful tuning parameters on `HoverPilotHoverEnv`:
   - `ground_contact_grace_seconds`
   - `known_terminal_aircraft_status_codes`
 
-The environment prefers explicit RealFlight Link state flags first. Teleport / reposition detection is kept as a fallback because the Hover Trainer can reset by suddenly moving the aircraft back near the hover target without updating the more semantic lifecycle flags.
+The environment prefers explicit RealFlight Link reset signals first. Teleport / reposition detection is kept as a fallback because the Hover Trainer can reset by suddenly moving the aircraft without updating the more semantic lifecycle flags.
 
 ## License
 
