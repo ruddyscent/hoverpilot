@@ -1,6 +1,6 @@
 import time
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Callable
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import gymnasium as gym
 import numpy as np
@@ -21,19 +21,19 @@ DEFAULT_RESET_WAIT_SECONDS = 8.0
 DEFAULT_RESET_POLL_INTERVAL_SECONDS = 0.05
 
 
-@dataclass(slots=True)
+@dataclass
 class EpisodeLifecycleResult:
     ready: bool
     started: bool
     terminated: bool
     truncated: bool
-    reason: str | None = None
+    reason: Optional[str] = None
 
 
-@dataclass(slots=True)
+@dataclass
 class EpisodeBoundaryAssessment:
     readiness: EpisodeLifecycleResult
-    reset_reason: str | None
+    reset_reason: Optional[str]
     can_start: bool
     pre_reset_wait: bool
 
@@ -67,7 +67,7 @@ def state_to_observation(state: FlightAxisState) -> np.ndarray:
 
 
 
-def gym_action_to_rf_action(action: np.ndarray | list[float] | tuple[float, ...]) -> RFControlAction:
+def gym_action_to_rf_action(action: Union[np.ndarray, list, tuple]) -> RFControlAction:
     action_array = np.asarray(action, dtype=np.float32).reshape(-1)
     if action_array.shape != (4,):
         raise ValueError("action must have shape (4,) for [aileron, elevator, throttle, rudder]")
@@ -85,15 +85,15 @@ def gym_action_to_rf_action(action: np.ndarray | list[float] | tuple[float, ...]
     )
 
 
-class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
+class HoverPilotHoverEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(
         self,
         host: str,
         port: int,
-        reward_config: RewardConfig | None = None,
-        max_episode_steps: int | None = None,
+        reward_config: Optional[RewardConfig] = None,
+        max_episode_steps: Optional[int] = None,
         sleep_interval_s: float = 0.0,
         anchor_target_to_reset_state: bool = True,
         reset_button_threshold: float = 0.5,
@@ -101,8 +101,8 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         physics_time_reset_tolerance_s: float = 1.0e-3,
         max_reset_wait_seconds: float = DEFAULT_RESET_WAIT_SECONDS,
         reset_poll_interval_seconds: float = DEFAULT_RESET_POLL_INTERVAL_SECONDS,
-        ready_controller_active_threshold: float | None = None,
-        ready_running_threshold: float | None = None,
+        ready_controller_active_threshold: Optional[float] = None,
+        ready_running_threshold: Optional[float] = None,
         ready_locked_threshold: float = BOOL_FIELD_THRESHOLD,
         require_nonzero_physics_time_for_ready: bool = True,
         allow_ground_contact_at_ready: bool = True,
@@ -112,7 +112,7 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         start_body_rate_threshold_deg_s: float = 60.0,
         reposition_speed_threshold_mps: float = 0.5,
         reset_teleport_distance_m: float = 2.0,
-        client_factory: Callable[[], RFLinkClient] | None = None,
+        client_factory: Optional[Callable[[], RFLinkClient]] = None,
     ):
         super().__init__()
         self.host = host
@@ -140,13 +140,13 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         self._client_factory = (
             client_factory if client_factory is not None else lambda: RFLinkClient(self.host, self.port)
         )
-        self._client: RFLinkClient | None = None
+        self._client = None  # type: Optional[RFLinkClient]
         self._episode_steps = 0
-        self._last_state: FlightAxisState | None = None
-        self._pending_episode_start: tuple[FlightAxisState, str] | None = None
+        self._last_state = None  # type: Optional[FlightAxisState]
+        self._pending_episode_start = None  # type: Optional[Tuple[FlightAxisState, str]]
         self._waiting_for_reset = False
         self._episode_started = False
-        self._ground_contact_started_at_s: float | None = None
+        self._ground_contact_started_at_s = None  # type: Optional[float]
 
         self.action_space = spaces.Box(
             low=np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32),
@@ -191,7 +191,7 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
             dtype=np.float32,
         )
 
-    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         super().reset(seed=seed)
         self._episode_steps = 0
         self._last_state = None
@@ -312,8 +312,8 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
 
     def poll_wait_for_next_episode(
         self,
-        action: np.ndarray | list[float] | tuple[float, ...] | None = None,
-    ) -> tuple[bool, np.ndarray, dict[str, Any]]:
+        action: Optional[Union[np.ndarray, list, tuple]] = None,
+    ) -> Tuple[bool, np.ndarray, Dict[str, Any]]:
         if self._client is None:
             raise RuntimeError("environment must be reset() before waiting for the next episode")
 
@@ -368,7 +368,7 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
 
     def wait_for_next_episode(
         self,
-        action: np.ndarray | list[float] | tuple[float, ...] | None = None,
+        action: Optional[Union[np.ndarray, list, tuple]] = None,
     ):
         while True:
             started, observation, info = self.poll_wait_for_next_episode(action=action)
@@ -411,12 +411,12 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
             return EpisodeLifecycleResult(False, False, False, False, "touching_ground")
         return EpisodeLifecycleResult(True, True, False, False, None)
 
-    def _wait_for_ready_state(self, action: RFControlAction) -> tuple[FlightAxisState, str]:
+    def _wait_for_ready_state(self, action: RFControlAction) -> Tuple[FlightAxisState, str]:
         deadline = time.monotonic() + self.max_reset_wait_seconds
-        last_state: FlightAxisState | None = None
+        last_state = None  # type: Optional[FlightAxisState]
         last_reason = "reset_timeout"
         startup_sync_required = False
-        pending_start_reason: str | None = None
+        pending_start_reason = None  # type: Optional[str]
         while time.monotonic() <= deadline:
             state = self._poll_state(action, interval_s=self.reset_poll_interval_seconds)
             assessment = self._assess_episode_boundary(
@@ -494,13 +494,13 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         reward_breakdown,
         truncated: bool,
         reset: bool,
-        episode_start_reason: str | None,
+        episode_start_reason: Optional[str],
         waiting_for_reset: bool,
         lifecycle: EpisodeLifecycleResult,
         readiness: EpisodeLifecycleResult,
         ground_contact_duration_s: float,
-    ) -> dict[str, Any]:
-        info: dict[str, Any] = {
+    ) -> Dict[str, Any]:
+        info = {  # type: Dict[str, Any]
             "state_summary": state.summary(),
             "debug_state": {
                 "x_m": state.m_aircraftPositionX_MTR,
@@ -543,7 +543,7 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
             info["termination_reason"] = reward_breakdown.termination_reason
         return info
 
-    def _detect_trainer_reset(self, state: FlightAxisState) -> str | None:
+    def _detect_trainer_reset(self, state: FlightAxisState) -> Optional[str]:
         if state.m_resetButtonHasBeenPressed >= self.reset_button_threshold:
             return "trainer_reset_button"
 
@@ -562,7 +562,7 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
 
         return None
 
-    def _detect_parked_episode_boundary(self, state: FlightAxisState) -> str | None:
+    def _detect_parked_episode_boundary(self, state: FlightAxisState) -> Optional[str]:
         if not self._episode_started:
             return None
         if not self._is_parked_on_ground_state(state):
@@ -612,7 +612,7 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         state: FlightAxisState,
         *,
         require_reset_boundary: bool,
-        pending_reset_reason: str | None,
+        pending_reset_reason: Optional[str],
     ) -> EpisodeBoundaryAssessment:
         readiness = self.compute_episode_start_status(state)
         reset_reason = self._detect_trainer_reset(state)

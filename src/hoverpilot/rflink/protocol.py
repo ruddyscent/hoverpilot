@@ -1,4 +1,5 @@
 from xml.etree import ElementTree as ET
+from typing import List, Optional
 
 from hoverpilot.rflink.models import FlightAxisState, RF_CHANNEL_COUNT
 
@@ -81,7 +82,7 @@ def build_simple_request(host: str, action: str, body_inner_xml: str) -> bytes:
 
 def build_exchange_data_request(
     host: str,
-    channel_values: list[float] | None = None,
+    channel_values: Optional[List[float]] = None,
     selected_channels: int = 4095,
 ) -> bytes:
     values = channel_values or [0.0] * RF_CHANNEL_COUNT
@@ -133,7 +134,7 @@ def parse_http_body(data: bytes) -> str:
 def parse_state(xml_text: str) -> FlightAxisState:
     root = ET.fromstring(xml_text)
     state = FlightAxisState()
-    item_values: list[float] = []
+    item_values: List[float] = []
 
     for element in root.iter():
         tag = _strip_namespace(element.tag)
