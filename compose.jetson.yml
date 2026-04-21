@@ -1,0 +1,22 @@
+services:
+  hoverpilot:
+    image: ${HOVERPILOT_NGC_IMAGE:?Set HOVERPILOT_NGC_IMAGE to an NGC PyTorch image tag that matches your JetPack/L4T release.}
+    container_name: hoverpilot-jetson
+    working_dir: /workspace/hover-pilot
+    command: ["bash", "-lc", "sleep infinity"]
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      UV_LINK_MODE: copy
+    volumes:
+      - .:/workspace/hover-pilot
+      - hoverpilot-uv-cache:/root/.cache/uv
+
+volumes:
+  hoverpilot-uv-cache:

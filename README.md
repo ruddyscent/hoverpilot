@@ -155,6 +155,78 @@ The environment prefers explicit RealFlight Link reset signals first. Teleport /
 
 A lightweight PPO trainer is now available in `hoverpilot.rl.ppo`.
 
+## Jetson Xavier NX with NGC PyTorch Container
+
+HoverPilot can be run on Jetson Xavier NX inside an NVIDIA NGC PyTorch container using
+the provided Compose file [compose.jetson.yml](/Users/kwchun/Workspace/hover-pilot/compose.jetson.yml).
+
+Prerequisites on the Jetson host:
+
+- JetPack installed on the device
+- NVIDIA Container Toolkit configured for Docker
+- Docker access for your user
+- NGC login completed with `docker login nvcr.io`
+
+The exact NGC image tag must match the JetPack / L4T release on the device.
+Use [.env.example](/Users/kwchun/Workspace/hover-pilot/.env.example) as a template:
+
+```bash
+cp .env.example .env
+```
+
+Then set the NGC image in `.env`:
+
+```bash
+HOVERPILOT_NGC_IMAGE=nvcr.io/nvidia/<official-jetson-pytorch-image>:<matching-tag>
+```
+
+Bring up the container:
+
+```bash
+docker compose -f compose.jetson.yml up -d
+docker compose -f compose.jetson.yml exec hoverpilot bash
+```
+
+The project source tree is mounted into `/workspace/hover-pilot` inside the container.
+
+### Using uv Without Replacing Container PyTorch
+
+The NGC image already includes NVIDIA's Jetson-optimized PyTorch build.
+To keep `uv` from replacing that PyTorch installation:
+
+```bash
+cd /workspace/hover-pilot
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+uv sync --extra rl --no-install-package torch --inexact
+```
+
+Why this setup:
+
+- `--system-site-packages` lets the virtual environment see the PyTorch already installed in the container
+- `--no-install-package torch` tells `uv` not to install its own `torch`
+- `--inexact` avoids removing packages already provided by the container image
+
+After that, prefer `uv run --no-sync ...` so execution does not try to resync and replace packages:
+
+```bash
+uv run --no-sync hoverpilot-demo
+uv run --no-sync hoverpilot-validate --episodes 2 --max-episode-steps 100
+uv run --no-sync hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
+```
+
+Run TensorBoard from inside the container:
+
+```bash
+uv run --no-sync tensorboard --host 0.0.0.0 --port 6006 --logdir runs
+```
+
+Because the Compose file uses host networking on Jetson, TensorBoard is then available at:
+
+```text
+http://<jetson-ip>:6006
+```
+
 Install the optional RL dependency:
 
 ```bash
