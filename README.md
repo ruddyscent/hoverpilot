@@ -173,16 +173,68 @@ Train a policy (requires torch):
 uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
 ```
 
+Training writes TensorBoard logs to `runs/hoverpilot-ppo` by default.
+
 Customize training with additional options:
 
 ```bash
 uv run hoverpilot-ppo train --timesteps 50000 \
   --save-path ppo_hoverpilot.pt \
   --max-episode-steps 300 \
+  --n-steps 2048 \
+  --batch-size 128 \
+  --epochs 10 \
+  --learning-rate 3e-4 \
+  --gamma 0.99 \
+  --gae-lambda 0.95 \
+  --clip-epsilon 0.2 \
+  --value-coef 0.5 \
+  --entropy-coef 0.01 \
+  --max-grad-norm 0.5 \
   --eval-episodes 5 \
   --log-interval 10 \
+  --tensorboard-log-dir runs/hoverpilot-ppo-exp1 \
   --seed 42
 ```
+
+The PPO CLI now exposes these tuning parameters directly:
+
+- `--n-steps`
+- `--batch-size`
+- `--epochs`
+- `--learning-rate`
+- `--gamma`
+- `--gae-lambda`
+- `--clip-epsilon`
+- `--value-coef`
+- `--entropy-coef`
+- `--max-grad-norm`
+
+To disable TensorBoard logging for a run:
+
+```bash
+uv run hoverpilot-ppo train --timesteps 50000 --disable-tensorboard
+```
+
+Monitor training with TensorBoard:
+
+```bash
+uv run tensorboard --logdir runs
+```
+
+Then open `http://localhost:6006`.
+
+Useful TensorBoard scalars include:
+
+- `train/episode_reward`
+- `train/episode_length`
+- `train/reward_mean`
+- `train/action/throttle_mean`
+- `train/termination/parked_on_ground`
+- `train/policy_loss`
+- `train/value_loss`
+- `train/entropy`
+- `eval/avg_reward`
 
 Validate the environment before training:
 

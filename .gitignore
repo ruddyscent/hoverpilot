@@ -238,6 +238,10 @@ venv.bak/
 
 # Spyder project settings
 .spyderproject
+
+# TensorBoard
+runs/hoverpilot-ppo/
+runs/**/events.out.tfevents.*
 .spyproject
 
 # Rope project settings
@@ -397,4 +401,3 @@ zsdoc/data
 
 # Local container/dev environment files
 .devcontainer/
-

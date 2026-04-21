@@ -19,6 +19,11 @@ try:
 except ImportError as exc:
     raise ImportError("PyTorch is required to use PPO training. Install it with `pip install torch`.") from exc
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+
 from hoverpilot.config import HOST, PORT
 from hoverpilot.envs import HoverPilotHoverEnv
 from hoverpilot.training.hover import RewardConfig
@@ -55,6 +60,7 @@ class PPOConfig:
     log_interval: int = 1
     initial_action: tuple[float, float, float, float] = (0.0, 0.0, 0.55, 0.0)
     wait_action: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    tensorboard_log_dir: str | None = "runs/hoverpilot-ppo"
 
 
 class ActorCritic(nn.Module):
@@ -177,8 +183,19 @@ class PPOTrainer:
         action_dim = int(np.prod(self.env.action_space.shape))
         self.model = ActorCritic(observation_dim, action_dim).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
+        self.writer = self._build_writer()
         if config.seed is not None:
             self.seed(config.seed)
+
+    def _build_writer(self):
+        if self.config.tensorboard_log_dir is None:
+            return None
+        if SummaryWriter is None:
+            raise ImportError(
+                "TensorBoard logging requires `tensorboard`. Install the RL extra with "
+                "`uv sync --extra rl`."
+            )
+        return SummaryWriter(log_dir=self.config.tensorboard_log_dir)
 
     def _wait_action(self) -> np.ndarray:
         return np.asarray(self.config.wait_action, dtype=np.float32)
@@ -193,6 +210,24 @@ class PPOTrainer:
             column = actions[:, index]
             parts.append(f"{label}=mean:{column.mean():+.3f} std:{column.std():.3f}")
         return " ".join(parts)
+
+    def _write_scalar(self, tag: str, value: float, step: int):
+        if self.writer is not None:
+            self.writer.add_scalar(tag, value, step)
+
+    def _write_action_metrics(self, actions: np.ndarray, step: int):
+        labels = ("aileron", "elevator", "throttle", "rudder")
+        for index, label in enumerate(labels[: actions.shape[1]]):
+            column = actions[:, index]
+            self._write_scalar(f"train/action/{label}_mean", float(column.mean()), step)
+            self._write_scalar(f"train/action/{label}_std", float(column.std()), step)
+
+    def _write_termination_metrics(self, termination_reasons: list[str], step: int):
+        counts = Counter(termination_reasons)
+        total = max(1, len(termination_reasons))
+        for reason, count in counts.items():
+            self._write_scalar(f"train/termination/{reason}", float(count), step)
+            self._write_scalar(f"train/termination_rate/{reason}", float(count) / total, step)
 
     def _format_reward_breakdown(self, info: dict | None) -> str:
         if not info:
@@ -311,121 +346,168 @@ class PPOTrainer:
         training_start = time.time()
         episode_rewards = []
         episode_lengths = []
-        observation, info = reset_env_with_wait(
-            self.env,
-            action=self._wait_action(),
-            initial_action=self._initial_action(),
-        )
-        self._log_episode_start(info)
-
-        while total_steps < self.config.timesteps:
-            rollout = RolloutBuffer(self.config.n_steps, *self.env.observation_space.shape, self.env.action_space.shape[0], self.device)
-            episode_reward = 0.0
-            episode_length = 0
-            rollout_actions: list[np.ndarray] = []
-            rollout_rewards: list[float] = []
-            rollout_termination_reasons: list[str] = []
-            for step in range(self.config.n_steps):
-                obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
-                action_tensor, log_prob_tensor, value_tensor = self.model.get_action(obs_tensor)
-                action = action_tensor.squeeze(0).detach().cpu().numpy()
-                clipped_action = self._normalize_action(action)
-                next_obs, reward, terminated, truncated, info = self.env.step(clipped_action)
-                done = bool(terminated or truncated)
-                rollout_actions.append(clipped_action.copy())
-                rollout_rewards.append(float(reward))
-                rollout_termination_reasons.append(info.get("termination_reason") or ("truncated" if truncated else "incomplete"))
-                rollout.add(
-                    observation,
-                    clipped_action,
-                    reward,
-                    done,
-                    float(value_tensor.item()),
-                    float(log_prob_tensor.item()),
-                )
-                episode_reward += reward
-                episode_length += 1
-                observation = next_obs
-                total_steps += 1
-                if done:
-                    self._log_episode_end(
-                        episode_length=episode_length,
-                        episode_reward=episode_reward,
-                        info=info,
-                    )
-                    episode_rewards.append(episode_reward)
-                    episode_lengths.append(episode_length)
-                    observation, info = reset_env_with_wait(
-                        self.env,
-                        action=self._wait_action(),
-                        initial_action=self._initial_action(),
-                    )
-                    self._log_episode_start(info)
-                    episode_reward = 0.0
-                    episode_length = 0
-                if total_steps >= self.config.timesteps:
-                    break
-
-            last_value = self.model(torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0))[2].item()
-            rollout.compute_returns_and_advantages(last_value, self.config.gamma, self.config.gae_lambda)
-            advantages = rollout.advantages[: rollout.index]
-            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
-            returns = rollout.returns[: rollout.index]
-
-            self._log_rollout_summary(
-                total_steps=total_steps,
-                rollout=rollout,
-                actions=rollout_actions,
-                rewards=rollout_rewards,
-                termination_reasons=rollout_termination_reasons,
-                elapsed_s=time.time() - training_start,
+        if self.writer is not None:
+            self.writer.add_text(
+                "run/config",
+                "\n".join(
+                    [
+                        f"timesteps={self.config.timesteps}",
+                        f"n_steps={self.config.n_steps}",
+                        f"batch_size={self.config.batch_size}",
+                        f"epochs={self.config.epochs}",
+                        f"learning_rate={self.config.learning_rate}",
+                        f"max_episode_steps={self.config.max_episode_steps}",
+                        f"seed={self.config.seed}",
+                    ]
+                ),
+                0,
             )
-
-            policy_losses = []
-            value_losses = []
-            entropy_values = []
-            ratio_values = []
-            for epoch in range(self.config.epochs):
-                for batch_obs, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in rollout.get_batches(self.config.batch_size):
-                    batch_log_probs, batch_entropy, batch_values, _ = self.model.evaluate_actions(batch_obs, batch_actions)
-                    ratio = torch.exp(batch_log_probs - batch_old_log_probs)
-                    surrogate1 = ratio * batch_advantages
-                    surrogate2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * batch_advantages
-                    policy_loss = -torch.min(surrogate1, surrogate2).mean()
-                    value_loss = self.config.value_coef * (batch_returns - batch_values).pow(2).mean()
-                    entropy_loss = -self.config.entropy_coef * batch_entropy.mean()
-                    loss = policy_loss + value_loss + entropy_loss
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                    self.optimizer.step()
-                    policy_losses.append(float(policy_loss.item()))
-                    value_losses.append(float(value_loss.item()))
-                    entropy_values.append(float(batch_entropy.mean().item()))
-                    ratio_values.append(float(ratio.mean().item()))
-
-            self._log_update_summary(
-                total_steps=total_steps,
-                policy_losses=policy_losses,
-                value_losses=value_losses,
-                entropy_values=entropy_values,
-                ratio_values=ratio_values,
-                returns=returns,
-                advantages=advantages,
+        try:
+            observation, info = reset_env_with_wait(
+                self.env,
+                action=self._wait_action(),
+                initial_action=self._initial_action(),
             )
+            self._log_episode_start(info)
 
-            if len(episode_rewards) >= report_every:
-                avg_reward = float(np.mean(episode_rewards[-report_every:]))
-                avg_length = float(np.mean(episode_lengths[-report_every:]))
-                elapsed = time.time() - training_start
-                print(
-                    f"[PPO] steps={total_steps}/{self.config.timesteps} "
-                    f"avg_reward={avg_reward:.3f} avg_length={avg_length:.1f} elapsed={elapsed:.1f}s"
+            while total_steps < self.config.timesteps:
+                rollout = RolloutBuffer(self.config.n_steps, *self.env.observation_space.shape, self.env.action_space.shape[0], self.device)
+                episode_reward = 0.0
+                episode_length = 0
+                rollout_actions: list[np.ndarray] = []
+                rollout_rewards: list[float] = []
+                rollout_termination_reasons: list[str] = []
+                for step in range(self.config.n_steps):
+                    obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
+                    action_tensor, log_prob_tensor, value_tensor = self.model.get_action(obs_tensor)
+                    action = action_tensor.squeeze(0).detach().cpu().numpy()
+                    clipped_action = self._normalize_action(action)
+                    next_obs, reward, terminated, truncated, info = self.env.step(clipped_action)
+                    done = bool(terminated or truncated)
+                    rollout_actions.append(clipped_action.copy())
+                    rollout_rewards.append(float(reward))
+                    rollout_termination_reasons.append(info.get("termination_reason") or ("truncated" if truncated else "incomplete"))
+                    rollout.add(
+                        observation,
+                        clipped_action,
+                        reward,
+                        done,
+                        float(value_tensor.item()),
+                        float(log_prob_tensor.item()),
+                    )
+                    episode_reward += reward
+                    episode_length += 1
+                    observation = next_obs
+                    total_steps += 1
+                    if done:
+                        self._log_episode_end(
+                            episode_length=episode_length,
+                            episode_reward=episode_reward,
+                            info=info,
+                        )
+                        self._write_scalar("train/episode_reward", float(episode_reward), total_steps)
+                        self._write_scalar("train/episode_length", float(episode_length), total_steps)
+                        episode_rewards.append(episode_reward)
+                        episode_lengths.append(episode_length)
+                        observation, info = reset_env_with_wait(
+                            self.env,
+                            action=self._wait_action(),
+                            initial_action=self._initial_action(),
+                        )
+                        self._log_episode_start(info)
+                        episode_reward = 0.0
+                        episode_length = 0
+                    if total_steps >= self.config.timesteps:
+                        break
+
+                last_value = self.model(torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0))[2].item()
+                rollout.compute_returns_and_advantages(last_value, self.config.gamma, self.config.gae_lambda)
+                advantages = rollout.advantages[: rollout.index]
+                advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+                returns = rollout.returns[: rollout.index]
+
+                self._log_rollout_summary(
+                    total_steps=total_steps,
+                    rollout=rollout,
+                    actions=rollout_actions,
+                    rewards=rollout_rewards,
+                    termination_reasons=rollout_termination_reasons,
+                    elapsed_s=time.time() - training_start,
                 )
 
-        torch.save(self.model.state_dict(), self.config.save_path)
-        print(f"Saved trained policy to {self.config.save_path}")
-        self._evaluate_policy()
+                action_array = np.asarray(rollout_actions, dtype=np.float32)
+                self._write_scalar("train/reward_mean", float(np.mean(rollout_rewards)), total_steps)
+                self._write_scalar("train/reward_min", float(np.min(rollout_rewards)), total_steps)
+                self._write_scalar("train/reward_max", float(np.max(rollout_rewards)), total_steps)
+                self._write_scalar(
+                    "train/done_rate",
+                    float(sum(1 for reason in rollout_termination_reasons if reason != "incomplete") / max(1, rollout.index)),
+                    total_steps,
+                )
+                self._write_scalar("train/return_mean", float(returns.mean().item()), total_steps)
+                self._write_scalar("train/return_std", float(returns.std(unbiased=False).item()), total_steps)
+                self._write_scalar("train/advantage_mean", float(advantages.mean().item()), total_steps)
+                self._write_scalar("train/advantage_std", float(advantages.std(unbiased=False).item()), total_steps)
+                self._write_action_metrics(action_array, total_steps)
+                self._write_termination_metrics(rollout_termination_reasons, total_steps)
+
+                policy_losses = []
+                value_losses = []
+                entropy_values = []
+                ratio_values = []
+                for epoch in range(self.config.epochs):
+                    for batch_obs, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in rollout.get_batches(self.config.batch_size):
+                        batch_log_probs, batch_entropy, batch_values, _ = self.model.evaluate_actions(batch_obs, batch_actions)
+                        ratio = torch.exp(batch_log_probs - batch_old_log_probs)
+                        surrogate1 = ratio * batch_advantages
+                        surrogate2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * batch_advantages
+                        policy_loss = -torch.min(surrogate1, surrogate2).mean()
+                        value_loss = self.config.value_coef * (batch_returns - batch_values).pow(2).mean()
+                        entropy_loss = -self.config.entropy_coef * batch_entropy.mean()
+                        loss = policy_loss + value_loss + entropy_loss
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                        self.optimizer.step()
+                        policy_losses.append(float(policy_loss.item()))
+                        value_losses.append(float(value_loss.item()))
+                        entropy_values.append(float(batch_entropy.mean().item()))
+                        ratio_values.append(float(ratio.mean().item()))
+
+                self._log_update_summary(
+                    total_steps=total_steps,
+                    policy_losses=policy_losses,
+                    value_losses=value_losses,
+                    entropy_values=entropy_values,
+                    ratio_values=ratio_values,
+                    returns=returns,
+                    advantages=advantages,
+                )
+                self._write_scalar("train/policy_loss", float(np.mean(policy_losses)), total_steps)
+                self._write_scalar("train/value_loss", float(np.mean(value_losses)), total_steps)
+                self._write_scalar("train/entropy", float(np.mean(entropy_values)), total_steps)
+                self._write_scalar("train/ratio", float(np.mean(ratio_values)), total_steps)
+
+                if len(episode_rewards) >= report_every:
+                    avg_reward = float(np.mean(episode_rewards[-report_every:]))
+                    avg_length = float(np.mean(episode_lengths[-report_every:]))
+                    elapsed = time.time() - training_start
+                    print(
+                        f"[PPO] steps={total_steps}/{self.config.timesteps} "
+                        f"avg_reward={avg_reward:.3f} avg_length={avg_length:.1f} elapsed={elapsed:.1f}s"
+                    )
+                    self._write_scalar("train/avg_reward", avg_reward, total_steps)
+                    self._write_scalar("train/avg_length", avg_length, total_steps)
+
+                if self.writer is not None:
+                    self.writer.flush()
+
+            torch.save(self.model.state_dict(), self.config.save_path)
+            print(f"Saved trained policy to {self.config.save_path}")
+            self._evaluate_policy()
+        finally:
+            if self.writer is not None:
+                self.writer.close()
 
     def _evaluate_policy(self):
         rewards = []
@@ -451,7 +533,11 @@ class PPOTrainer:
                     break
             rewards.append(episode_reward)
             lengths.append(episode_length)
-        print(f"Evaluation: avg_reward={np.mean(rewards):.3f}, avg_length={np.mean(lengths):.1f}")
+        avg_reward = float(np.mean(rewards))
+        avg_length = float(np.mean(lengths))
+        print(f"Evaluation: avg_reward={avg_reward:.3f}, avg_length={avg_length:.1f}")
+        self._write_scalar("eval/avg_reward", avg_reward, self.config.timesteps)
+        self._write_scalar("eval/avg_length", avg_length, self.config.timesteps)
 
 
 def reset_env_with_wait(
@@ -539,8 +625,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     train_parser.add_argument("--seed", type=int, default=None)
     train_parser.add_argument("--max-episode-steps", type=int, default=300)
     train_parser.add_argument("--sleep-interval-s", type=float, default=0.0)
+    train_parser.add_argument("--n-steps", type=int, default=1024)
+    train_parser.add_argument("--batch-size", type=int, default=64)
+    train_parser.add_argument("--epochs", type=int, default=10)
+    train_parser.add_argument("--learning-rate", type=float, default=3e-4)
+    train_parser.add_argument("--gamma", type=float, default=0.99)
+    train_parser.add_argument("--gae-lambda", type=float, default=0.95)
+    train_parser.add_argument("--clip-epsilon", type=float, default=0.2)
+    train_parser.add_argument("--value-coef", type=float, default=0.5)
+    train_parser.add_argument("--entropy-coef", type=float, default=0.01)
+    train_parser.add_argument("--max-grad-norm", type=float, default=0.5)
     train_parser.add_argument("--log-interval", type=int, default=1)
     train_parser.add_argument("--eval-episodes", type=int, default=3)
+    train_parser.add_argument("--tensorboard-log-dir", type=str, default="runs/hoverpilot-ppo")
+    train_parser.add_argument("--disable-tensorboard", action="store_true")
     train_parser.add_argument("--host", type=str, default=HOST)
     train_parser.add_argument("--port", type=int, default=PORT)
 
@@ -562,10 +660,21 @@ def main(argv: list[str] | None = None):
             timesteps=args.timesteps,
             max_episode_steps=args.max_episode_steps,
             sleep_interval_s=args.sleep_interval_s,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            clip_epsilon=args.clip_epsilon,
+            value_coef=args.value_coef,
+            entropy_coef=args.entropy_coef,
+            max_grad_norm=args.max_grad_norm,
             save_path=args.save_path,
             seed=args.seed,
             eval_episodes=args.eval_episodes,
             log_interval=args.log_interval,
+            tensorboard_log_dir=None if args.disable_tensorboard else args.tensorboard_log_dir,
         )
         trainer = PPOTrainer(config)
         trainer.train()

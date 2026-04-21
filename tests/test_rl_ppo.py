@@ -41,7 +41,7 @@ class ResetWaitEnv:
 class PPOTrainingModuleTests(unittest.TestCase):
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_ppo_config_and_trainer_import(self):
-        config = PPOConfig(timesteps=1, max_episode_steps=1)
+        config = PPOConfig(timesteps=1, max_episode_steps=1, tensorboard_log_dir=None)
         trainer = PPOTrainer(config)
         self.assertEqual(trainer.config.timesteps, 1)
         self.assertEqual(trainer.config.max_episode_steps, 1)
