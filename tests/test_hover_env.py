@@ -667,6 +667,61 @@ class HoverEnvTests(unittest.TestCase):
         self.assertEqual(info["termination_reason"], "touching_ground")
         env.close()
 
+    def test_parked_on_ground_state_terminates_episode_and_waits_for_reset(self):
+        client = StubRFLinkClient([
+            self._state(
+                m_altitudeAGL_MTR=1.6,
+                m_groundspeed_MPS=0.2,
+                m_airspeed_MPS=0.2,
+                m_pitchRate_DEGpSEC=2.0,
+                m_rollRate_DEGpSEC=3.0,
+                m_yawRate_DEGpSEC=1.0,
+            ),
+            self._state(
+                m_currentPhysicsTime_SEC=10.2,
+                m_altitudeAGL_MTR=0.14,
+                m_groundspeed_MPS=0.0,
+                m_airspeed_MPS=0.0,
+                m_pitchRate_DEGpSEC=0.0,
+                m_rollRate_DEGpSEC=0.0,
+                m_yawRate_DEGpSEC=0.0,
+            ),
+            self._state(
+                m_currentPhysicsTime_SEC=10.4,
+                m_aircraftPositionX_MTR=0.5,
+                m_aircraftPositionY_MTR=-0.2,
+                m_altitudeAGL_MTR=1.7,
+                m_groundspeed_MPS=0.3,
+                m_airspeed_MPS=0.4,
+                m_pitchRate_DEGpSEC=4.0,
+                m_rollRate_DEGpSEC=5.0,
+                m_yawRate_DEGpSEC=2.0,
+            ),
+        ])
+        env = HoverPilotHoverEnv(
+            host="127.0.0.1",
+            port=18083,
+            client_factory=lambda: client,
+            minimum_start_altitude_agl_m=0.25,
+        )
+        env.reset()
+
+        _, _, terminated, truncated, info = env.step(np.asarray([0.0, 0.0, 0.5, 0.0], dtype=np.float32))
+
+        self.assertTrue(terminated)
+        self.assertFalse(truncated)
+        self.assertEqual(info["termination_reason"], "parked_on_ground")
+        self.assertTrue(info["waiting_for_reset"])
+
+        started, observation, next_info = env.poll_wait_for_next_episode(
+            action=np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        )
+
+        self.assertFalse(started)
+        self.assertEqual(observation.shape, (12,))
+        self.assertTrue(next_info["waiting_for_reset"])
+        env.close()
+
     def test_boundary_logic_still_works(self):
         client = StubRFLinkClient([
             self._state(),

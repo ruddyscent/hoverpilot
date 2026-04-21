@@ -7,6 +7,8 @@ Minimal Python client to connect to RealFlight Link (TCP 18083), exchange RC com
 ## Quickstart
 
 ```bash
+python3 -m venv .venv
+. .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -e .
 cp .env.example .env
 python -m hoverpilot.main
@@ -132,6 +134,53 @@ Useful tuning parameters on `HoverPilotHoverEnv`:
   - `known_terminal_aircraft_status_codes`
 
 The environment prefers explicit RealFlight Link reset signals first. Teleport / reposition detection is kept as a fallback because the Hover Trainer can reset by suddenly moving the aircraft without updating the more semantic lifecycle flags.
+
+## PPO Training and Environment Validation
+
+A lightweight PPO trainer is now available in `hoverpilot.rl.ppo`.
+
+Install the optional RL dependency:
+
+```bash
+pip install -e .[rl]
+```
+
+If torch installation fails (e.g., on Alpine aarch64), install the base package instead:
+
+```bash
+pip install -e .
+```
+
+Train a policy (requires torch):
+
+```bash
+python -m hoverpilot.rl.ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
+```
+
+Customize training with additional options:
+
+```bash
+python -m hoverpilot.rl.ppo train --timesteps 50000 \
+  --save-path ppo_hoverpilot.pt \
+  --max-episode-steps 300 \
+  --eval-episodes 5 \
+  --log-interval 10 \
+  --seed 42
+```
+
+Validate the environment before training:
+
+```bash
+python src/hoverpilot/validate_env.py --episodes 2 --max-episode-steps 100
+```
+
+This validation command helps confirm:
+
+- `reset()` behavior and `episode_start_reason`
+- observation shape and bounds
+- action scaling across the drone control channels
+- reward and termination signals during short episodes
+- whether boundary termination is firing too aggressively
 
 ## License
 

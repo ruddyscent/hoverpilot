@@ -11,5 +11,12 @@ dependencies = [
     "python-dotenv"
 ]
 
+[project.optional-dependencies]
+rl = ["torch>=2.0.0"]
+
+[project.scripts]
+hoverpilot-validate = "hoverpilot.validate_env:main"
+hoverpilot-ppo = "hoverpilot.rl.ppo:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

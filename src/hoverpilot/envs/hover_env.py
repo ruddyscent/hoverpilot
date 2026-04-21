@@ -234,6 +234,7 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         readiness = self.compute_episode_start_status(state)
         trainer_reset_reason = self._detect_trainer_reset(state)
+        parked_reason = self._detect_parked_episode_boundary(state)
         lifecycle = EpisodeLifecycleResult(
             ready=readiness.ready,
             started=self._episode_started,
@@ -261,6 +262,23 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
             )
             termination = TerminationResult(True, trainer_reset_reason)
             lifecycle = replace(lifecycle, terminated=True, started=False, reason=trainer_reset_reason)
+
+        if (
+            parked_reason is not None
+            and trainer_reset_reason is None
+            and (not termination.terminated or termination.termination_reason == "altitude_too_low")
+        ):
+            self._waiting_for_reset = True
+            self._episode_started = False
+            reward_breakdown = replace(
+                reward_breakdown,
+                reward=reward_breakdown.reward + self.reward_config.terminal_failure_reward,
+                terminal_penalty=reward_breakdown.terminal_penalty + self.reward_config.terminal_failure_reward,
+                terminated=True,
+                termination_reason=parked_reason,
+            )
+            termination = TerminationResult(True, parked_reason)
+            lifecycle = replace(lifecycle, terminated=True, started=False, reason=parked_reason)
 
         self._episode_steps += 1
         truncated = self.max_episode_steps is not None and self._episode_steps >= self.max_episode_steps
@@ -544,6 +562,13 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
 
         return None
 
+    def _detect_parked_episode_boundary(self, state: FlightAxisState) -> str | None:
+        if not self._episode_started:
+            return None
+        if not self._is_parked_on_ground_state(state):
+            return None
+        return "parked_on_ground"
+
     def _update_ground_contact_duration(self, state: FlightAxisState) -> float:
         if not self._episode_started or not self._is_touching_ground(state):
             self._ground_contact_started_at_s = None
@@ -608,7 +633,8 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
 
     def _is_pre_reset_wait_state(self, state: FlightAxisState) -> bool:
         return (
-            self._is_low_altitude_wait_state(state)
+            self._is_parked_on_ground_state(state)
+            or self._is_low_altitude_wait_state(state)
             or (
                 self._is_inactive_reset_state(state)
                 and not self._is_start_stable_state(state)
@@ -624,6 +650,9 @@ class HoverPilotHoverEnv(gym.Env[np.ndarray, np.ndarray]):
         # ground. Treat low AGL itself as a strong "not started yet" signal even if
         # the aircraft still has some residual motion.
         return state.m_altitudeAGL_MTR <= self.minimum_start_altitude_agl_m
+
+    def _is_parked_on_ground_state(self, state: FlightAxisState) -> bool:
+        return self._is_low_altitude_wait_state(state) and self._is_reset_like_stationary_state(state)
 
     def _is_start_stable_state(self, state: FlightAxisState) -> bool:
         # A valid episode start should not begin mid-crash or mid-fall. Require a

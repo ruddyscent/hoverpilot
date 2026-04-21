@@ -1,0 +1,390 @@
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import random
+import sys
+import time
+from dataclasses import dataclass, field
+
+import gymnasium as gym
+import numpy as np
+
+try:
+    import torch
+    from torch import nn
+    from torch.distributions import Normal
+except ImportError as exc:
+    raise ImportError("PyTorch is required to use PPO training. Install it with `pip install torch`.") from exc
+
+from hoverpilot.config import HOST, PORT
+from hoverpilot.envs import HoverPilotHoverEnv
+from hoverpilot.training.hover import RewardConfig
+from hoverpilot.utils.logger import format_debug_state
+
+
+WAITING_LOG_INTERVAL_S = 0.75
+
+
+@dataclass
+class PPOConfig:
+    host: str = HOST
+    port: int = PORT
+    reward_config: RewardConfig = field(default_factory=RewardConfig)
+    max_episode_steps: int | None = 300
+    sleep_interval_s: float = 0.0
+
+    timesteps: int = 50_000
+    n_steps: int = 1024
+    batch_size: int = 64
+    epochs: int = 10
+    learning_rate: float = 3e-4
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_epsilon: float = 0.2
+    value_coef: float = 0.5
+    entropy_coef: float = 0.01
+    max_grad_norm: float = 0.5
+    seed: int | None = None
+    save_path: str = "ppo_hoverpilot.pt"
+    eval_episodes: int = 3
+    log_interval: int = 1
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, observation_dim: int, action_dim: int):
+        super().__init__()
+        hidden_sizes = [128, 128]
+        layers = []
+        input_size = observation_dim
+        for hidden in hidden_sizes:
+            layers.append(nn.Linear(input_size, hidden))
+            layers.append(nn.ReLU(inplace=True))
+            input_size = hidden
+        self.shared = nn.Sequential(*layers)
+        self.policy_mean = nn.Linear(hidden_sizes[-1], action_dim)
+        self.policy_log_std = nn.Parameter(torch.zeros(action_dim, dtype=torch.float32))
+        self.value_head = nn.Linear(hidden_sizes[-1], 1)
+
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden = self.shared(obs)
+        mean = self.policy_mean(hidden)
+        value = self.value_head(hidden).squeeze(-1)
+        log_std = self.policy_log_std.expand_as(mean)
+        return mean, log_std, value
+
+    def get_action(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean, log_std, value = self(obs)
+        std = torch.exp(log_std)
+        dist = Normal(mean, std)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(-1)
+        return action, log_prob, value
+
+    def evaluate_actions(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean, log_std, value = self(obs)
+        std = torch.exp(log_std)
+        dist = Normal(mean, std)
+        log_probs = dist.log_prob(actions).sum(-1)
+        entropy = dist.entropy().sum(-1)
+        return log_probs, entropy, value, mean
+
+
+class RolloutBuffer:
+    def __init__(self, capacity: int, observation_dim: int, action_dim: int, device: torch.device):
+        self.device = device
+        self.observations = torch.zeros((capacity, observation_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32, device=device)
+        self.rewards = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.dones = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.values = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.log_probs = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.advantages = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.returns = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.index = 0
+        self.capacity = capacity
+
+    def add(
+        self,
+        observation: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        done: bool,
+        value: float,
+        log_prob: float,
+    ):
+        if self.index >= self.capacity:
+            raise IndexError("RolloutBuffer is full")
+        self.observations[self.index].copy_(torch.as_tensor(observation, dtype=torch.float32, device=self.device))
+        self.actions[self.index].copy_(torch.as_tensor(action, dtype=torch.float32, device=self.device))
+        self.rewards[self.index] = reward
+        self.dones[self.index] = 0.0 if done else 1.0
+        self.values[self.index] = value
+        self.log_probs[self.index] = log_prob
+        self.index += 1
+
+    def compute_returns_and_advantages(
+        self,
+        last_value: float,
+        gamma: float,
+        lam: float,
+    ):
+        gae = 0.0
+        last_value_tensor = torch.tensor(last_value, dtype=torch.float32, device=self.device)
+        for step in reversed(range(self.index)):
+            next_value = last_value_tensor if step == self.index - 1 else self.values[step + 1]
+            delta = self.rewards[step] + gamma * next_value * self.dones[step] - self.values[step]
+            gae = delta + gamma * lam * self.dones[step] * gae
+            self.advantages[step] = gae
+        self.returns[: self.index] = self.advantages[: self.index] + self.values[: self.index]
+
+    def get_batches(self, batch_size: int):
+        indices = torch.randperm(self.index, device=self.device)
+        for start in range(0, self.index, batch_size):
+            end = start + batch_size
+            batch_idx = indices[start:end]
+            yield (
+                self.observations[batch_idx],
+                self.actions[batch_idx],
+                self.log_probs[batch_idx],
+                self.advantages[batch_idx],
+                self.returns[batch_idx],
+            )
+
+
+class PPOTrainer:
+    def __init__(self, config: PPOConfig):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.env = self._build_env()
+        observation_dim = int(np.prod(self.env.observation_space.shape))
+        action_dim = int(np.prod(self.env.action_space.shape))
+        self.model = ActorCritic(observation_dim, action_dim).to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
+        if config.seed is not None:
+            self.seed(config.seed)
+
+    def _build_env(self) -> gym.Env:
+        env = HoverPilotHoverEnv(
+            host=self.config.host,
+            port=self.config.port,
+            reward_config=self.config.reward_config,
+            max_episode_steps=self.config.max_episode_steps,
+            sleep_interval_s=self.config.sleep_interval_s,
+        )
+        return env
+
+    def seed(self, seed: int):
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if hasattr(torch, "cuda"):
+            torch.cuda.manual_seed_all(seed)
+
+    def _normalize_action(self, raw_action: np.ndarray) -> np.ndarray:
+        low = self.env.action_space.low
+        high = self.env.action_space.high
+        return np.clip(raw_action, low, high)
+
+    def train(self):
+        total_steps = 0
+        report_every = max(1, self.config.log_interval)
+        training_start = time.time()
+        episode_rewards = []
+        episode_lengths = []
+        observation, _ = reset_env_with_wait(self.env)
+
+        while total_steps < self.config.timesteps:
+            rollout = RolloutBuffer(self.config.n_steps, *self.env.observation_space.shape, self.env.action_space.shape[0], self.device)
+            episode_reward = 0.0
+            episode_length = 0
+            for step in range(self.config.n_steps):
+                obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
+                action_tensor, log_prob_tensor, value_tensor = self.model.get_action(obs_tensor)
+                action = action_tensor.squeeze(0).detach().cpu().numpy()
+                clipped_action = self._normalize_action(action)
+                next_obs, reward, terminated, truncated, info = self.env.step(clipped_action)
+                done = bool(terminated or truncated)
+                rollout.add(
+                    observation,
+                    clipped_action,
+                    reward,
+                    done,
+                    float(value_tensor.item()),
+                    float(log_prob_tensor.item()),
+                )
+                episode_reward += reward
+                episode_length += 1
+                observation = next_obs
+                total_steps += 1
+                if done:
+                    episode_rewards.append(episode_reward)
+                    episode_lengths.append(episode_length)
+                    observation, _ = reset_env_with_wait(self.env)
+                    episode_reward = 0.0
+                    episode_length = 0
+                if total_steps >= self.config.timesteps:
+                    break
+
+            last_value = self.model(torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0))[2].item()
+            rollout.compute_returns_and_advantages(last_value, self.config.gamma, self.config.gae_lambda)
+            advantages = rollout.advantages[: rollout.index]
+            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
+            for epoch in range(self.config.epochs):
+                for batch_obs, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in rollout.get_batches(self.config.batch_size):
+                    batch_log_probs, batch_entropy, batch_values, _ = self.model.evaluate_actions(batch_obs, batch_actions)
+                    ratio = torch.exp(batch_log_probs - batch_old_log_probs)
+                    surrogate1 = ratio * batch_advantages
+                    surrogate2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * batch_advantages
+                    policy_loss = -torch.min(surrogate1, surrogate2).mean()
+                    value_loss = self.config.value_coef * (batch_returns - batch_values).pow(2).mean()
+                    entropy_loss = -self.config.entropy_coef * batch_entropy.mean()
+                    loss = policy_loss + value_loss + entropy_loss
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    self.optimizer.step()
+
+            if len(episode_rewards) >= report_every:
+                avg_reward = float(np.mean(episode_rewards[-report_every:]))
+                avg_length = float(np.mean(episode_lengths[-report_every:]))
+                elapsed = time.time() - training_start
+                print(
+                    f"[PPO] steps={total_steps}/{self.config.timesteps} "
+                    f"avg_reward={avg_reward:.3f} avg_length={avg_length:.1f} elapsed={elapsed:.1f}s"
+                )
+
+        torch.save(self.model.state_dict(), self.config.save_path)
+        print(f"Saved trained policy to {self.config.save_path}")
+        self._evaluate_policy()
+
+    def _evaluate_policy(self):
+        rewards = []
+        lengths = []
+        for episode in range(self.config.eval_episodes):
+            observation, _ = reset_env_with_wait(self.env)
+            episode_reward = 0.0
+            episode_length = 0
+            while True:
+                obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
+                with torch.no_grad():
+                    mean, _, _ = self.model(obs_tensor)
+                action = mean.squeeze(0).cpu().numpy()
+                clipped_action = self._normalize_action(action)
+                observation, reward, terminated, truncated, info = self.env.step(clipped_action)
+                episode_reward += reward
+                episode_length += 1
+                if terminated or truncated:
+                    break
+            rewards.append(episode_reward)
+            lengths.append(episode_length)
+        print(f"Evaluation: avg_reward={np.mean(rewards):.3f}, avg_length={np.mean(lengths):.1f}")
+
+
+def reset_env_with_wait(
+    env: gym.Env,
+    *,
+    action: np.ndarray | list[float] | tuple[float, ...] | None = None,
+):
+    try:
+        return env.reset()
+    except TimeoutError as exc:
+        poll_wait = getattr(env, "poll_wait_for_next_episode", None)
+        if not callable(poll_wait):
+            raise
+
+        print(f"waiting for trainer reset before episode | {exc}")
+        last_wait_log_at = 0.0
+        while True:
+            started, observation, info = poll_wait(action=action)
+            if started:
+                return observation, info
+            now = time.monotonic()
+            if now - last_wait_log_at >= WAITING_LOG_INTERVAL_S:
+                print(f"waiting for trainer reset | {format_debug_state(info.get('debug_state'))}")
+                last_wait_log_at = now
+
+
+def validate_environment(host: str, port: int, episodes: int = 2, max_episode_steps: int | None = 100):
+    env = HoverPilotHoverEnv(
+        host=host,
+        port=port,
+        max_episode_steps=max_episode_steps,
+    )
+    print("Action space:", env.action_space)
+    print("Observation space:", env.observation_space)
+    print("Sample observation:", env.observation_space.sample())
+
+    for episode in range(episodes):
+        observation, info = reset_env_with_wait(env)
+        print(f"Episode {episode + 1} reset observation shape={observation.shape}, reason={info.get('episode_start_reason')}")
+        if info.get("episode_readiness"):
+            print("  readiness:", info["episode_readiness"])
+        step = 0
+        while step < max_episode_steps:
+            action = env.action_space.sample()
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            print(
+                f"  step={step} reward={reward:.3f} terminated={terminated} truncated={truncated} "
+                f"reason={info.get('termination_reason')}"
+            )
+            if terminated or truncated:
+                break
+            step += 1
+        if step == max_episode_steps:
+            print("  reached max_episode_steps without termination")
+    env.close()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train PPO on HoverPilot Hover Env or validate environment quality.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    train_parser = subparsers.add_parser("train", help="Train a PPO policy")
+    train_parser.add_argument("--timesteps", type=int, default=50_000)
+    train_parser.add_argument("--save-path", type=str, default="ppo_hoverpilot.pt")
+    train_parser.add_argument("--seed", type=int, default=None)
+    train_parser.add_argument("--max-episode-steps", type=int, default=300)
+    train_parser.add_argument("--sleep-interval-s", type=float, default=0.0)
+    train_parser.add_argument("--log-interval", type=int, default=1)
+    train_parser.add_argument("--eval-episodes", type=int, default=3)
+    train_parser.add_argument("--host", type=str, default=HOST)
+    train_parser.add_argument("--port", type=int, default=PORT)
+
+    validate_parser = subparsers.add_parser("validate", help="Validate environment reset, observation, reward, and action scaling")
+    validate_parser.add_argument("--episodes", type=int, default=2)
+    validate_parser.add_argument("--max-episode-steps", type=int, default=100)
+    validate_parser.add_argument("--host", type=str, default=HOST)
+    validate_parser.add_argument("--port", type=int, default=PORT)
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
+    if args.command == "train":
+        config = PPOConfig(
+            host=args.host,
+            port=args.port,
+            timesteps=args.timesteps,
+            max_episode_steps=args.max_episode_steps,
+            sleep_interval_s=args.sleep_interval_s,
+            save_path=args.save_path,
+            seed=args.seed,
+            eval_episodes=args.eval_episodes,
+            log_interval=args.log_interval,
+        )
+        trainer = PPOTrainer(config)
+        trainer.train()
+    elif args.command == "validate":
+        validate_environment(args.host, args.port, episodes=args.episodes, max_episode_steps=args.max_episode_steps)
+
+
+if __name__ == "__main__":
+    main()
