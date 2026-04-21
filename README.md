@@ -6,6 +6,22 @@ Minimal Python client to connect to RealFlight Link (TCP 18083), exchange RC com
 
 ## Quickstart
 
+Recommended with `uv`:
+
+```bash
+uv sync
+cp .env.example .env
+uv run hoverpilot-demo
+```
+
+If you prefer module execution, this also works after `uv sync`:
+
+```bash
+uv run python -m hoverpilot.main
+```
+
+Legacy `pip` workflow:
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate  # On Windows: .venv\Scripts\activate
@@ -142,25 +158,25 @@ A lightweight PPO trainer is now available in `hoverpilot.rl.ppo`.
 Install the optional RL dependency:
 
 ```bash
-pip install -e .[rl]
+uv sync --extra rl
 ```
 
 If torch installation fails (e.g., on Alpine aarch64), install the base package instead:
 
 ```bash
-pip install -e .
+uv sync
 ```
 
 Train a policy (requires torch):
 
 ```bash
-python -m hoverpilot.rl.ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
+uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
 ```
 
 Customize training with additional options:
 
 ```bash
-python -m hoverpilot.rl.ppo train --timesteps 50000 \
+uv run hoverpilot-ppo train --timesteps 50000 \
   --save-path ppo_hoverpilot.pt \
   --max-episode-steps 300 \
   --eval-episodes 5 \
@@ -171,7 +187,7 @@ python -m hoverpilot.rl.ppo train --timesteps 50000 \
 Validate the environment before training:
 
 ```bash
-python src/hoverpilot/validate_env.py --episodes 2 --max-episode-steps 100
+uv run hoverpilot-validate --episodes 2 --max-episode-steps 100
 ```
 
 This validation command helps confirm:

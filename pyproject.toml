@@ -1,7 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hoverpilot-rflink"
 version = "0.1.0"
 description = "RealFlight Link client for HoverPilot"
+readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
@@ -15,8 +20,14 @@ dependencies = [
 rl = ["torch>=2.0.0"]
 
 [project.scripts]
+hoverpilot-demo = "hoverpilot.main:main"
 hoverpilot-validate = "hoverpilot.validate_env:main"
 hoverpilot-ppo = "hoverpilot.rl.ppo:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
