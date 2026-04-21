@@ -6,11 +6,12 @@ Use this to check environment quality before installing RL dependencies.
 
 import argparse
 import sys
+from typing import List, Optional
 from hoverpilot.config import HOST, PORT
 from hoverpilot.envs import HoverPilotHoverEnv
 
 
-def validate_environment(host: str, port: int, episodes: int = 2, max_episode_steps: int | None = 100):
+def validate_environment(host: str, port: int, episodes: int = 2, max_episode_steps: Optional[int] = 100):
     env = HoverPilotHoverEnv(
         host=host,
         port=port,
@@ -45,7 +46,7 @@ def validate_environment(host: str, port: int, episodes: int = 2, max_episode_st
     env.close()
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate environment quality without RL dependencies.")
     parser.add_argument("--episodes", type=int, default=2, help="Number of episodes to validate")
     parser.add_argument("--max-episode-steps", type=int, default=100, help="Max steps per episode")
@@ -54,7 +55,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None):
+def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
     validate_environment(args.host, args.port, episodes=args.episodes, max_episode_steps=args.max_episode_steps)
 

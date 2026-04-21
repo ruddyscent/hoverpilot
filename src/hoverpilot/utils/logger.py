@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -10,7 +10,7 @@ from hoverpilot.rflink.models import FlightAxisState
 ACTION_LABELS = ("ail", "ele", "thr", "rud")
 
 
-def format_debug_state(debug_state: Mapping[str, object] | None) -> str:
+def format_debug_state(debug_state: Optional[Mapping[str, object]]) -> str:
     if not isinstance(debug_state, Mapping):
         return "debug unavailable"
 
@@ -36,7 +36,7 @@ def format_action(action: Sequence[float]) -> str:
     if values.shape != (4,):
         raise ValueError("action must have shape (4,)")
     return "TX " + " ".join(
-        f"{label}={value:+0.3f}" for label, value in zip(ACTION_LABELS, values, strict=True)
+        f"{label}={value:+0.3f}" for label, value in zip(ACTION_LABELS, values)
     )
 
 

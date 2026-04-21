@@ -7,7 +7,7 @@ name = "hoverpilot-rflink"
 version = "0.1.0"
 description = "RealFlight Link client for HoverPilot"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 
 dependencies = [
     "gymnasium",
@@ -18,8 +18,10 @@ dependencies = [
 
 [project.optional-dependencies]
 rl = [
-    "tensorboard>=2.16.0",
-    "torch>=2.0.0",
+    "tensorboard>=2.10,<2.16; python_version < '3.9'",
+    "tensorboard>=2.16.0; python_version >= '3.9'",
+    "torch>=1.12; python_version < '3.10'",
+    "torch>=2.0.0; python_version >= '3.10'",
 ]
 
 [project.scripts]

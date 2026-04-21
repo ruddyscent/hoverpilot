@@ -155,17 +155,22 @@ The environment prefers explicit RealFlight Link reset signals first. Teleport /
 
 A lightweight PPO trainer is now available in `hoverpilot.rl.ppo`.
 
-## Jetson Xavier NX with NGC PyTorch Container
+## NVIDIA Jetson with NGC PyTorch Container
 
-HoverPilot can be run on Jetson Xavier NX inside an NVIDIA NGC PyTorch container using
+HoverPilot can be run on NVIDIA Jetson inside an NVIDIA NGC PyTorch container using
 the provided Compose file [compose.jetson.yml](/Users/kwchun/Workspace/hover-pilot/compose.jetson.yml).
 
 Prerequisites on the Jetson host:
 
-- JetPack installed on the device
+- JetPack 5.0.2 or newer installed on the device
 - NVIDIA Container Toolkit configured for Docker
 - Docker access for your user
 - NGC login completed with `docker login nvcr.io`
+
+HoverPilot's Jetson container workflow assumes a JetPack 5.x class environment with
+Ubuntu 20.04 / Python 3.8. JetPack 5.0.2 is the minimum supported baseline in this
+README because it is the first production-quality JetPack 5 release and supports
+NVIDIA Jetson Xavier NX modules.
 
 The exact NGC image tag must match the JetPack / L4T release on the device.
 Use [.env.example](/Users/kwchun/Workspace/hover-pilot/.env.example) as a template:
@@ -196,16 +201,23 @@ To keep `uv` from replacing that PyTorch installation:
 
 ```bash
 cd /workspace/hover-pilot
-python3 -m venv --system-site-packages .venv
+export UV_PYTHON=/usr/bin/python3
+uv venv --python /usr/bin/python3 --system-site-packages
 source .venv/bin/activate
-uv sync --extra rl --no-install-package torch --inexact
+python3 -c "import torch; print(torch.__version__)"
+uv sync --python /usr/bin/python3 --extra rl --no-install-package torch --inexact
+python3 -c "import torch; print(torch.__version__)"
 ```
 
 Why this setup:
 
+- `uv venv --python /usr/bin/python3 --system-site-packages` creates the project environment from the Jetson container's system Python instead of a uv-managed Python
 - `--system-site-packages` lets the virtual environment see the PyTorch already installed in the container
 - `--no-install-package torch` tells `uv` not to install its own `torch`
 - `--inexact` avoids removing packages already provided by the container image
+
+If `uv sync` prints a different interpreter version and recreates `.venv`, remove the
+environment and repeat the steps above with `UV_PYTHON=/usr/bin/python3` set.
 
 After that, prefer `uv run --no-sync ...` so execution does not try to resync and replace packages:
 

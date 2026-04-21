@@ -1,7 +1,7 @@
 import os
 import socket
 import time
-from typing import Mapping
+from typing import Mapping, Optional, Tuple
 
 from hoverpilot.rflink.models import DEFAULT_CHANNEL_MAP, FlightAxisState, RFControlAction
 from hoverpilot.rflink.protocol import (
@@ -18,9 +18,9 @@ class RFLinkClient:
         self,
         host: str,
         port: int,
-        channel_map: Mapping[str, int] | None = None,
+        channel_map: Optional[Mapping[str, int]] = None,
         socket_timeout_s: float = 1.0,
-        debug_state_flags: bool | None = None,
+        debug_state_flags: Optional[bool] = None,
     ):
         self.host = host
         self.port = port
@@ -33,13 +33,13 @@ class RFLinkClient:
         self._buffer = b""
         self._controller_started = False
         self._printed_zero_state_debug = False
-        self._last_flag_debug_tuple: tuple[float, float, float] | None = None
+        self._last_flag_debug_tuple: Optional[Tuple[float, float, float]] = None
 
     def connect(self):
         self._open_socket(log=True)
         self._start_controller()
 
-    def request_state(self, action: RFControlAction | None = None) -> FlightAxisState:
+    def request_state(self, action: Optional[RFControlAction] = None) -> FlightAxisState:
         try:
             self._ensure_controller_ready()
             self._send_exchange_request(action)
@@ -59,7 +59,7 @@ class RFLinkClient:
         self._maybe_print_flag_debug(state)
         return state
 
-    def step(self, action: RFControlAction | None = None) -> FlightAxisState:
+    def step(self, action: Optional[RFControlAction] = None) -> FlightAxisState:
         return self.request_state(action=action)
 
     def close(self, restore_controller: bool = True):
@@ -141,7 +141,7 @@ class RFLinkClient:
         self.sock.sendall(build_simple_request(self.host, action, body_inner_xml))
         self._receive_http_response(close_after_read=True)
 
-    def _send_exchange_request(self, action: RFControlAction | None = None):
+    def _send_exchange_request(self, action: Optional[RFControlAction] = None):
         self._ensure_socket()
         channel_values = None if action is None else action.to_channel_values(self.channel_map)
         self.sock.sendall(build_exchange_data_request(self.host, channel_values=channel_values))

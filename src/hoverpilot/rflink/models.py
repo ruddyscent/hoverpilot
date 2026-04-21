@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from math import isfinite
-from typing import Mapping
+from typing import Dict, List, Mapping, Optional
 
 
 RF_CHANNEL_COUNT = 12
@@ -37,7 +37,7 @@ def _normalize_channel_override(index: int, value: float) -> float:
     return _clamp(_validate_finite(f"channel override {index}", value), 0.0, 1.0)
 
 
-@dataclass(slots=True)
+@dataclass
 class RFControlAction:
     """Normalized RC action values for RealFlight Link.
 
@@ -50,7 +50,7 @@ class RFControlAction:
     aileron: float = 0.0
     elevator: float = 0.0
     rudder: float = 0.0
-    channel_overrides: dict[int, float] = field(default_factory=dict)
+    channel_overrides: Dict[int, float] = field(default_factory=dict)
 
     def __post_init__(self):
         self.throttle = _normalize_throttle(self.throttle)
@@ -72,8 +72,8 @@ class RFControlAction:
 
     def to_channel_values(
         self,
-        channel_map: Mapping[str, int] | None = None,
-    ) -> list[float]:
+        channel_map: Optional[Mapping[str, int]] = None,
+    ) -> List[float]:
         mapping = dict(DEFAULT_CHANNEL_MAP if channel_map is None else channel_map)
         _validate_channel_map(mapping)
 
@@ -105,9 +105,9 @@ def _validate_channel_map(channel_map: Mapping[str, int]) -> None:
         raise ValueError("channel_map must not assign multiple controls to the same channel")
 
 
-@dataclass(slots=True)
+@dataclass
 class FlightAxisState:
-    rcin: list[float] = field(default_factory=lambda: [0.0] * RF_CHANNEL_COUNT)
+    rcin: List[float] = field(default_factory=lambda: [0.0] * RF_CHANNEL_COUNT)
     m_airspeed_MPS: float = 0.0
     m_altitudeASL_MTR: float = 0.0
     m_altitudeAGL_MTR: float = 0.0

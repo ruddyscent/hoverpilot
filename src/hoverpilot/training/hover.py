@@ -1,9 +1,10 @@
 from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 from hoverpilot.rflink.models import FlightAxisState
 
 
-@dataclass(slots=True)
+@dataclass
 class RewardConfig:
     target_x_m: float = 0.0
     target_y_m: float = 0.0
@@ -18,7 +19,7 @@ class RewardConfig:
     boundary_proximity_weight: float = 0.75
     terminal_failure_reward: float = -25.0
     proximity_penalty_margin_ratio: float = 0.25
-    controller_active_threshold: float | None = None
+    controller_active_threshold: Optional[float] = None
     lost_components_threshold: float = 0.5
     locked_threshold: float = 0.5
     engine_running_threshold: float = 0.5
@@ -26,16 +27,16 @@ class RewardConfig:
     terminate_on_engine_stopped: bool = False
     terminate_on_touching_ground: bool = True
     ground_contact_grace_seconds: float = 0.0
-    known_terminal_aircraft_status_codes: tuple[float, ...] = field(default_factory=tuple)
+    known_terminal_aircraft_status_codes: Tuple[float, ...] = field(default_factory=tuple)
 
 
-@dataclass(slots=True)
+@dataclass
 class TerminationResult:
     terminated: bool
-    termination_reason: str | None = None
+    termination_reason: Optional[str] = None
 
 
-@dataclass(slots=True)
+@dataclass
 class RewardBreakdown:
     reward: float
     position_penalty: float
@@ -44,7 +45,7 @@ class RewardBreakdown:
     boundary_proximity_penalty: float
     terminal_penalty: float
     terminated: bool
-    termination_reason: str | None
+    termination_reason: Optional[str]
 
 
 

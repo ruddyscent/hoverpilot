@@ -8,6 +8,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Union
 
 import gymnasium as gym
 import numpy as np
@@ -40,7 +41,7 @@ class PPOConfig:
     host: str = HOST
     port: int = PORT
     reward_config: RewardConfig = field(default_factory=RewardConfig)
-    max_episode_steps: int | None = 300
+    max_episode_steps: Optional[int] = 300
     sleep_interval_s: float = 0.0
 
     timesteps: int = 50_000
@@ -54,13 +55,13 @@ class PPOConfig:
     value_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
-    seed: int | None = None
+    seed: Optional[int] = None
     save_path: str = "ppo_hoverpilot.pt"
     eval_episodes: int = 3
     log_interval: int = 1
-    initial_action: tuple[float, float, float, float] = (0.0, 0.0, 0.55, 0.0)
-    wait_action: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
-    tensorboard_log_dir: str | None = "runs/hoverpilot-ppo"
+    initial_action: Tuple[float, float, float, float] = (0.0, 0.0, 0.55, 0.0)
+    wait_action: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    tensorboard_log_dir: Optional[str] = "runs/hoverpilot-ppo"
 
 
 class ActorCritic(nn.Module):
@@ -229,7 +230,7 @@ class PPOTrainer:
             self._write_scalar(f"train/termination/{reason}", float(count), step)
             self._write_scalar(f"train/termination_rate/{reason}", float(count) / total, step)
 
-    def _format_reward_breakdown(self, info: dict | None) -> str:
+    def _format_reward_breakdown(self, info: Optional[Dict]) -> str:
         if not info:
             return ""
         breakdown = info.get("reward_breakdown")
@@ -543,8 +544,8 @@ class PPOTrainer:
 def reset_env_with_wait(
     env: gym.Env,
     *,
-    action: np.ndarray | list[float] | tuple[float, ...] | None = None,
-    initial_action: np.ndarray | list[float] | tuple[float, ...] | None = None,
+    action: Optional[Union[np.ndarray, list, tuple]] = None,
+    initial_action: Optional[Union[np.ndarray, list, tuple]] = None,
 ):
     if getattr(env, "_waiting_for_reset", False):
         poll_wait = getattr(env, "poll_wait_for_next_episode", None)
@@ -570,7 +571,7 @@ def _wait_for_episode_start(
     env: gym.Env,
     *,
     poll_wait,
-    action: np.ndarray | list[float] | tuple[float, ...] | None,
+    action: Optional[Union[np.ndarray, list, tuple]],
 ):
     del env
     last_wait_log_at = 0.0
@@ -584,7 +585,7 @@ def _wait_for_episode_start(
             last_wait_log_at = now
 
 
-def validate_environment(host: str, port: int, episodes: int = 2, max_episode_steps: int | None = 100):
+def validate_environment(host: str, port: int, episodes: int = 2, max_episode_steps: Optional[int] = 100):
     env = HoverPilotHoverEnv(
         host=host,
         port=port,
@@ -615,9 +616,10 @@ def validate_environment(host: str, port: int, episodes: int = 2, max_episode_st
     env.close()
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO on HoverPilot Hover Env or validate environment quality.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
 
     train_parser = subparsers.add_parser("train", help="Train a PPO policy")
     train_parser.add_argument("--timesteps", type=int, default=50_000)
@@ -651,7 +653,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None):
+def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
     if args.command == "train":
         config = PPOConfig(
