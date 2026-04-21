@@ -6,6 +6,7 @@ import os
 import random
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 import gymnasium as gym
@@ -25,6 +26,8 @@ from hoverpilot.utils.logger import format_debug_state
 
 
 WAITING_LOG_INTERVAL_S = 0.75
+DEFAULT_WAIT_ACTION = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+DEFAULT_INITIAL_ACTION = np.asarray([0.0, 0.0, 0.55, 0.0], dtype=np.float32)
 
 
 @dataclass
@@ -50,6 +53,8 @@ class PPOConfig:
     save_path: str = "ppo_hoverpilot.pt"
     eval_episodes: int = 3
     log_interval: int = 1
+    initial_action: tuple[float, float, float, float] = (0.0, 0.0, 0.55, 0.0)
+    wait_action: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
 
 
 class ActorCritic(nn.Module):
@@ -66,6 +71,12 @@ class ActorCritic(nn.Module):
         self.policy_mean = nn.Linear(hidden_sizes[-1], action_dim)
         self.policy_log_std = nn.Parameter(torch.zeros(action_dim, dtype=torch.float32))
         self.value_head = nn.Linear(hidden_sizes[-1], 1)
+        with torch.no_grad():
+            self.policy_mean.bias.zero_()
+            if action_dim >= 3:
+                # Hover training needs non-zero throttle from the first step.
+                self.policy_mean.bias[2] = float(DEFAULT_INITIAL_ACTION[2])
+                self.policy_log_std[2] = -1.0
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden = self.shared(obs)
@@ -169,6 +180,109 @@ class PPOTrainer:
         if config.seed is not None:
             self.seed(config.seed)
 
+    def _wait_action(self) -> np.ndarray:
+        return np.asarray(self.config.wait_action, dtype=np.float32)
+
+    def _initial_action(self) -> np.ndarray:
+        return np.asarray(self.config.initial_action, dtype=np.float32)
+
+    def _format_action_stats(self, actions: np.ndarray) -> str:
+        labels = ("ail", "ele", "thr", "rud")
+        parts = []
+        for index, label in enumerate(labels[: actions.shape[1]]):
+            column = actions[:, index]
+            parts.append(f"{label}=mean:{column.mean():+.3f} std:{column.std():.3f}")
+        return " ".join(parts)
+
+    def _format_reward_breakdown(self, info: dict | None) -> str:
+        if not info:
+            return ""
+        breakdown = info.get("reward_breakdown")
+        if not breakdown:
+            return ""
+        return (
+            " "
+            f"reward_terms(pos={breakdown.get('position_reward', 0.0):+.3f} "
+            f"att={breakdown.get('attitude_reward', 0.0):+.3f} "
+            f"vel={breakdown.get('velocity_penalty', 0.0):+.3f} "
+            f"rate={breakdown.get('angular_rate_penalty', 0.0):+.3f} "
+            f"boundary={breakdown.get('boundary_penalty', 0.0):+.3f} "
+            f"terminal={breakdown.get('terminal_penalty', 0.0):+.3f})"
+        )
+
+    def _log_episode_start(self, info: dict[str, object]):
+        debug_state = info.get("debug_state") if isinstance(info, dict) else None
+        print(
+            f"[PPO] episode start reason={info.get('episode_start_reason')} "
+            f"waiting={info.get('waiting_for_reset')}"
+        )
+        if debug_state:
+            print(f"[PPO] start state {format_debug_state(debug_state)}")
+
+    def _log_episode_end(
+        self,
+        *,
+        episode_length: int,
+        episode_reward: float,
+        info: dict[str, object],
+    ):
+        debug_state = info.get("debug_state") if isinstance(info, dict) else None
+        print(
+            f"[PPO] episode end steps={episode_length} reward={episode_reward:.3f} "
+            f"reason={info.get('termination_reason')}"
+            f"{self._format_reward_breakdown(info)}"
+        )
+        if debug_state:
+            print(f"[PPO] end state {format_debug_state(debug_state)}")
+
+    def _log_rollout_summary(
+        self,
+        *,
+        total_steps: int,
+        rollout: RolloutBuffer,
+        actions: list[np.ndarray],
+        rewards: list[float],
+        termination_reasons: list[str],
+        elapsed_s: float,
+    ):
+        if not rewards:
+            return
+        action_array = np.asarray(actions, dtype=np.float32)
+        termination_counts = Counter(termination_reasons)
+        reason_summary = ", ".join(
+            f"{reason}:{count}" for reason, count in sorted(termination_counts.items())
+        ) or "none"
+        print(
+            f"[PPO] rollout steps={total_steps}/{self.config.timesteps} "
+            f"samples={rollout.index} reward_mean={np.mean(rewards):+.3f} "
+            f"reward_min={np.min(rewards):+.3f} reward_max={np.max(rewards):+.3f} "
+            f"done_rate={sum(1 for reason in termination_reasons if reason != 'incomplete') / max(1, rollout.index):.3f} "
+            f"elapsed={elapsed_s:.1f}s"
+        )
+        print(f"[PPO] rollout actions {self._format_action_stats(action_array)}")
+        print(f"[PPO] rollout terminations {reason_summary}")
+
+    def _log_update_summary(
+        self,
+        *,
+        total_steps: int,
+        policy_losses: list[float],
+        value_losses: list[float],
+        entropy_values: list[float],
+        ratio_values: list[float],
+        returns: torch.Tensor,
+        advantages: torch.Tensor,
+    ):
+        print(
+            f"[PPO] update steps={total_steps}/{self.config.timesteps} "
+            f"policy_loss={np.mean(policy_losses):+.4f} "
+            f"value_loss={np.mean(value_losses):+.4f} "
+            f"entropy={np.mean(entropy_values):.4f} "
+            f"ratio={np.mean(ratio_values):.4f} "
+            f"return_mean={returns.mean().item():+.3f} "
+            f"adv_mean={advantages.mean().item():+.3f} adv_std={advantages.std(unbiased=False).item():.3f}"
+        )
+
     def _build_env(self) -> gym.Env:
         env = HoverPilotHoverEnv(
             host=self.config.host,
@@ -197,12 +311,20 @@ class PPOTrainer:
         training_start = time.time()
         episode_rewards = []
         episode_lengths = []
-        observation, _ = reset_env_with_wait(self.env)
+        observation, info = reset_env_with_wait(
+            self.env,
+            action=self._wait_action(),
+            initial_action=self._initial_action(),
+        )
+        self._log_episode_start(info)
 
         while total_steps < self.config.timesteps:
             rollout = RolloutBuffer(self.config.n_steps, *self.env.observation_space.shape, self.env.action_space.shape[0], self.device)
             episode_reward = 0.0
             episode_length = 0
+            rollout_actions: list[np.ndarray] = []
+            rollout_rewards: list[float] = []
+            rollout_termination_reasons: list[str] = []
             for step in range(self.config.n_steps):
                 obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
                 action_tensor, log_prob_tensor, value_tensor = self.model.get_action(obs_tensor)
@@ -210,6 +332,9 @@ class PPOTrainer:
                 clipped_action = self._normalize_action(action)
                 next_obs, reward, terminated, truncated, info = self.env.step(clipped_action)
                 done = bool(terminated or truncated)
+                rollout_actions.append(clipped_action.copy())
+                rollout_rewards.append(float(reward))
+                rollout_termination_reasons.append(info.get("termination_reason") or ("truncated" if truncated else "incomplete"))
                 rollout.add(
                     observation,
                     clipped_action,
@@ -223,9 +348,19 @@ class PPOTrainer:
                 observation = next_obs
                 total_steps += 1
                 if done:
+                    self._log_episode_end(
+                        episode_length=episode_length,
+                        episode_reward=episode_reward,
+                        info=info,
+                    )
                     episode_rewards.append(episode_reward)
                     episode_lengths.append(episode_length)
-                    observation, _ = reset_env_with_wait(self.env)
+                    observation, info = reset_env_with_wait(
+                        self.env,
+                        action=self._wait_action(),
+                        initial_action=self._initial_action(),
+                    )
+                    self._log_episode_start(info)
                     episode_reward = 0.0
                     episode_length = 0
                 if total_steps >= self.config.timesteps:
@@ -235,7 +370,21 @@ class PPOTrainer:
             rollout.compute_returns_and_advantages(last_value, self.config.gamma, self.config.gae_lambda)
             advantages = rollout.advantages[: rollout.index]
             advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+            returns = rollout.returns[: rollout.index]
 
+            self._log_rollout_summary(
+                total_steps=total_steps,
+                rollout=rollout,
+                actions=rollout_actions,
+                rewards=rollout_rewards,
+                termination_reasons=rollout_termination_reasons,
+                elapsed_s=time.time() - training_start,
+            )
+
+            policy_losses = []
+            value_losses = []
+            entropy_values = []
+            ratio_values = []
             for epoch in range(self.config.epochs):
                 for batch_obs, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in rollout.get_batches(self.config.batch_size):
                     batch_log_probs, batch_entropy, batch_values, _ = self.model.evaluate_actions(batch_obs, batch_actions)
@@ -250,6 +399,20 @@ class PPOTrainer:
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     self.optimizer.step()
+                    policy_losses.append(float(policy_loss.item()))
+                    value_losses.append(float(value_loss.item()))
+                    entropy_values.append(float(batch_entropy.mean().item()))
+                    ratio_values.append(float(ratio.mean().item()))
+
+            self._log_update_summary(
+                total_steps=total_steps,
+                policy_losses=policy_losses,
+                value_losses=value_losses,
+                entropy_values=entropy_values,
+                ratio_values=ratio_values,
+                returns=returns,
+                advantages=advantages,
+            )
 
             if len(episode_rewards) >= report_every:
                 avg_reward = float(np.mean(episode_rewards[-report_every:]))
@@ -268,7 +431,11 @@ class PPOTrainer:
         rewards = []
         lengths = []
         for episode in range(self.config.eval_episodes):
-            observation, _ = reset_env_with_wait(self.env)
+            observation, _ = reset_env_with_wait(
+                self.env,
+                action=self._wait_action(),
+                initial_action=self._initial_action(),
+            )
             episode_reward = 0.0
             episode_length = 0
             while True:
@@ -291,24 +458,44 @@ def reset_env_with_wait(
     env: gym.Env,
     *,
     action: np.ndarray | list[float] | tuple[float, ...] | None = None,
+    initial_action: np.ndarray | list[float] | tuple[float, ...] | None = None,
 ):
+    if getattr(env, "_waiting_for_reset", False):
+        poll_wait = getattr(env, "poll_wait_for_next_episode", None)
+        if not callable(poll_wait):
+            raise RuntimeError("environment reports waiting-for-reset but does not expose poll_wait_for_next_episode()")
+        return _wait_for_episode_start(env, poll_wait=poll_wait, action=action)
+
     try:
-        return env.reset()
+        reset_options = None
+        if initial_action is not None:
+            reset_options = {"initial_action": initial_action}
+        return env.reset(options=reset_options)
     except TimeoutError as exc:
         poll_wait = getattr(env, "poll_wait_for_next_episode", None)
         if not callable(poll_wait):
             raise
 
         print(f"waiting for trainer reset before episode | {exc}")
-        last_wait_log_at = 0.0
-        while True:
-            started, observation, info = poll_wait(action=action)
-            if started:
-                return observation, info
-            now = time.monotonic()
-            if now - last_wait_log_at >= WAITING_LOG_INTERVAL_S:
-                print(f"waiting for trainer reset | {format_debug_state(info.get('debug_state'))}")
-                last_wait_log_at = now
+        return _wait_for_episode_start(env, poll_wait=poll_wait, action=action)
+
+
+def _wait_for_episode_start(
+    env: gym.Env,
+    *,
+    poll_wait,
+    action: np.ndarray | list[float] | tuple[float, ...] | None,
+):
+    del env
+    last_wait_log_at = 0.0
+    while True:
+        started, observation, info = poll_wait(action=action)
+        if started:
+            return observation, info
+        now = time.monotonic()
+        if now - last_wait_log_at >= WAITING_LOG_INTERVAL_S:
+            print(f"waiting for trainer reset | {format_debug_state(info.get('debug_state'))}")
+            last_wait_log_at = now
 
 
 def validate_environment(host: str, port: int, episodes: int = 2, max_episode_steps: int | None = 100):
