@@ -4,6 +4,7 @@ import numpy as np
 
 from hoverpilot.config import HOST, PORT
 from hoverpilot.envs import HoverPilotHoverEnv
+from hoverpilot.rflink.client import RFLinkConnectionError
 from hoverpilot.training.hover import RewardConfig
 from hoverpilot.utils.logger import format_action, format_debug_state, format_step_log
 
@@ -77,6 +78,13 @@ def main():
                     if now - last_wait_log_at >= WAITING_LOG_INTERVAL_S:
                         print(f"waiting for trainer reset | {format_debug_state(info.get('debug_state'))}")
                         last_wait_log_at = now
+    except RFLinkConnectionError as exc:
+        print(f"[RFLINK] {exc}")
+        print(
+            "[RFLINK] Check that RealFlight is running with RealFlight Link enabled, "
+            "and set RFLINK_HOST to the host/IP reachable from this shell."
+        )
+        return 2
     except KeyboardInterrupt:
         print("Stopping...")
     finally:

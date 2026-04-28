@@ -13,6 +13,10 @@ from hoverpilot.rflink.protocol import (
 )
 
 
+class RFLinkConnectionError(ConnectionError):
+    """Raised when the RealFlight Link TCP endpoint cannot be reached."""
+
+
 class RFLinkClient:
     def __init__(
         self,
@@ -70,7 +74,7 @@ class RFLinkClient:
                 self.sock = None
         self._buffer = b""
 
-        if restore_controller:
+        if restore_controller and self._controller_started:
             self._restore_original_controller()
         self._controller_started = False
 
@@ -84,7 +88,18 @@ class RFLinkClient:
         self.close(restore_controller=False)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(self.socket_timeout_s)
-        self.sock.connect((self.host, self.port))
+        try:
+            self.sock.connect((self.host, self.port))
+        except (ConnectionError, OSError, TimeoutError, socket.timeout) as exc:
+            try:
+                self.sock.close()
+            finally:
+                self.sock = None
+                self._buffer = b""
+            raise RFLinkConnectionError(
+                f"unable to connect to RealFlight Link at {self.host}:{self.port} "
+                f"within {self.socket_timeout_s:.1f}s"
+            ) from exc
         if log:
             print(f"[RFLINK] Connected to {self.host}:{self.port}")
 
