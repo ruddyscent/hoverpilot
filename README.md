@@ -77,6 +77,21 @@ Reward and termination are integrated from `hoverpilot.training.hover`:
 
 `reset()` waits for a usable start state before returning. During this warmup the environment keeps sending a safe idle action and polls RealFlight until readiness is satisfied or a timeout is reached.
 
+### RealFlight Link host
+
+By default the client connects to `127.0.0.1:18083`. That is only correct when
+Python and RealFlight are running in the same network namespace. From a Docker
+container, VM, WSL instance, or Jetson talking to another machine, set
+`RFLINK_HOST` to the host/IP address that is reachable from that shell:
+
+```bash
+RFLINK_HOST=<realflight-host-ip> uv run --no-sync hoverpilot-demo
+```
+
+If startup reports `unable to connect to RealFlight Link`, verify that
+RealFlight is running, RealFlight Link is enabled, TCP port `18083` is reachable,
+and `RFLINK_HOST` is not still pointing at the container's own loopback address.
+
 ## Demo
 
 Run:
