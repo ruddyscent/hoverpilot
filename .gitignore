@@ -399,5 +399,12 @@ zsdoc/data
 
 # End of https://www.toptal.com/developers/gitignore/api/windows,powershell,macos,linux,zsh,vim,visualstudiocode,emacs,python,virtualenv,venv
 
-# Local container/dev environment files
-.devcontainer/
+# Machine learning model artifacts
+*.pt
+*.pth
+*.ckpt
+*.pb
+*.h5
+*.keras
+*.tflite
+saved_model/
